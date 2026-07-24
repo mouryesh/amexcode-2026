@@ -1,0 +1,47 @@
+# Illustrative / synthetic card replacement policy.
+#
+# Card replacement is a propose_confirm action: the agent proposes, the member
+# confirms, then the write commits. This policy governs whether a replacement
+# may be offered at all. Rules evaluate top-to-bottom; first full match wins.
+
+policy_id: card.replacement
+version: v1
+description: Assess eligibility to issue a replacement card.
+
+default:
+  outcome: APPROVE
+  reason_code: REPLACEMENT_ELIGIBLE
+  reason_text: >-
+    We can issue a replacement card. Please confirm and we'll get it sent out.
+
+rules:
+  - id: hardship_detected
+    when:
+      - { field: distress_signals, op: eq, value: true }
+    outcome: ESCALATE
+    reason_code: HARDSHIP_SIGNAL
+    reason_text: >-
+      We want to make sure you're supported — connecting you with a specialist.
+    rationale: Distress signals override routine servicing.
+
+  # Fraud hold on the account routes to the fraud team, not self-serve reissue.
+  - id: fraud_hold
+    when:
+      - { field: fraud_hold, op: eq, value: true }
+    outcome: ESCALATE
+    reason_code: FRAUD_HOLD_ACTIVE
+    reason_text: >-
+      There's an active security review on your account. For your protection a
+      specialist will handle the replacement with you directly.
+    rationale: Reissuing under a fraud hold could defeat the hold's purpose.
+
+  # A replacement was already issued very recently — avoid duplicate plastic.
+  - id: recent_replacement
+    when:
+      - { field: replacements_30d, op: gte, value: 1 }
+    outcome: QUEUE
+    reason_code: RECENT_REPLACEMENT
+    reason_text: >-
+      A replacement card was already issued in the last 30 days. We've flagged
+      this for a quick check to avoid sending a duplicate.
+    rationale: Guards against repeated reissue loops.

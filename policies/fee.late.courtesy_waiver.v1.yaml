@@ -1,0 +1,67 @@
+# Illustrative / synthetic courtesy late-fee waiver policy.
+#
+# THESE THRESHOLDS ARE ILLUSTRATIVE. Amex does not publish its real
+# courtesy-waiver rules. The point is that they live in a versioned document,
+# not a prompt — swap in the real credit policy and nothing else changes.
+#
+# Rules are evaluated top-to-bottom; the FIRST rule whose conditions all match
+# wins. If none match, `default` is returned.
+
+policy_id: fee.late.courtesy_waiver
+version: v1
+description: Courtesy waiver of a late payment fee, evaluated on account facts.
+
+default:
+  outcome: QUEUE
+  reason_code: MANUAL_REVIEW
+  reason_text: >-
+    This request needs a quick manual review before it can be completed.
+
+rules:
+  # Duty of care overrides everything. If distress signals are present we do
+  # not transact on the account — we escalate to a human.
+  - id: hardship_detected
+    when:
+      - { field: distress_signals, op: eq, value: true }
+    outcome: ESCALATE
+    reason_code: HARDSHIP_SIGNAL
+    reason_text: >-
+      We noticed you may be going through a difficult time. Rather than process
+      this automatically, we are connecting you with a specialist who can help.
+    rationale: Hardship is a duty-of-care matter, not a fee-waiver-counter decision.
+
+  # Brand-new accounts have insufficient history for a goodwill waiver.
+  - id: below_minimum_tenure
+    when:
+      - { field: tenure_months, op: lt, value: 6 }
+    outcome: DECLINE
+    reason_code: MIN_TENURE_NOT_MET
+    reason_text: >-
+      A courtesy waiver requires at least 6 months of account history. Your
+      account is newer than that, so this fee can't be waived automatically yet.
+    rationale: Minimum tenure guards goodwill waivers against fresh-account abuse.
+
+  # Too many recent courtesy waivers — the goodwill allowance is exhausted.
+  - id: repeat_waiver
+    when:
+      - { field: prior_waivers_8m, op: gte, value: 2 }
+    outcome: DECLINE
+    reason_code: WAIVER_FREQUENCY_EXCEEDED
+    reason_text: >-
+      Our records show two courtesy waivers on this account in the last eight
+      months. We're unable to waive another right now, but you can appeal this
+      decision and a specialist will review your circumstances.
+    rationale: Courtesy is finite; repeated waivers indicate a servicing pattern.
+
+  # Clean payer, enough tenure, allowance not exhausted → approve.
+  - id: clean_payer_approve
+    when:
+      - { field: tenure_months, op: gte, value: 6 }
+      - { field: prior_waivers_8m, op: lt, value: 2 }
+      - { field: late_payments_12m, op: lte, value: 1 }
+    outcome: APPROVE
+    reason_code: GOODWILL_WAIVER_GRANTED
+    reason_text: >-
+      Thanks for being a valued cardmember. As a one-time courtesy we've
+      reversed this late fee and your statement has been recalculated.
+    rationale: Long-tenured, low-delinquency members qualify for a goodwill waiver.

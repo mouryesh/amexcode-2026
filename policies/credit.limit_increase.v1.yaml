@@ -1,0 +1,76 @@
+# Illustrative / synthetic credit limit increase policy.
+#
+# THESE THRESHOLDS ARE ILLUSTRATIVE. The point is that they live in a versioned
+# document, not a prompt. Rules evaluate top-to-bottom; first full match wins.
+
+policy_id: credit.limit_increase
+version: v1
+description: Assess an unsecured credit limit increase request on account facts.
+
+default:
+  outcome: QUEUE
+  reason_code: UNDERWRITING_REVIEW
+  reason_text: >-
+    We've opened an underwriting case to review your request. You'll hear back
+    once the review is complete.
+
+rules:
+  - id: hardship_detected
+    when:
+      - { field: distress_signals, op: eq, value: true }
+    outcome: ESCALATE
+    reason_code: HARDSHIP_SIGNAL
+    reason_text: >-
+      It sounds like you may be under financial strain. Increasing your limit
+      may not be the right step, so we're connecting you with a specialist.
+    rationale: Never raise exposure on an account showing distress.
+
+  # Stale income data means we cannot responsibly auto-approve — queue it for
+  # a soft pull / underwriting rather than over-automating.
+  - id: stale_income
+    when:
+      - { field: income_staleness_months, op: gt, value: 12 }
+    outcome: QUEUE
+    reason_code: INCOME_DATA_STALE
+    reason_text: >-
+      To review a limit increase we need up-to-date income information. We've
+      opened an underwriting case and started a soft check — this won't affect
+      your credit score.
+    rationale: Responsible lending requires current income; stale data → human review.
+
+  # Thin file (short tenure) also queues rather than auto-approving.
+  - id: thin_file
+    when:
+      - { field: tenure_months, op: lt, value: 12 }
+    outcome: QUEUE
+    reason_code: THIN_FILE
+    reason_text: >-
+      Because your account is relatively new, we'll review this request through
+      underwriting rather than deciding it automatically.
+    rationale: Short history is insufficient signal to auto-approve exposure.
+
+  # High utilisation is a risk signal — decline auto increase.
+  - id: high_utilisation
+    when:
+      - { field: utilisation, op: gte, value: 0.9 }
+    outcome: DECLINE
+    reason_code: HIGH_UTILISATION
+    reason_text: >-
+      Your current balance is close to your existing limit. We're unable to
+      increase it right now. Reducing your balance first will help a future
+      request.
+    rationale: Very high utilisation signals repayment risk.
+
+  # Seasoned, well-utilised, current income → approve a modest increase.
+  - id: qualified_increase
+    when:
+      - { field: tenure_months, op: gte, value: 12 }
+      - { field: income_staleness_months, op: lte, value: 12 }
+      - { field: utilisation, op: lt, value: 0.6 }
+      - { field: late_payments_12m, op: eq, value: 0 }
+    outcome: APPROVE
+    reason_code: LIMIT_INCREASE_GRANTED
+    reason_text: >-
+      Good news — based on your account history we've approved a credit limit
+      increase.
+    rationale: Seasoned, current, low-utilisation, on-time members qualify.
