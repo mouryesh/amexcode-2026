@@ -1,127 +1,111 @@
-"""
-backend/accounts.py
+"""backend/accounts.py — read-side of the fake core banking system.
 
-Read-side. Pulls facts out of the DB for the policy engine and tools.
-Read-only: no function here changes anything.
+Owned by Person B. Split from writes so the policy engine's inputs come from a
+read-only surface: the policy engine never touches a function that could mutate
+state.
+
+Imports: backend.database, shared.schemas, shared.exceptions.
 """
+from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from typing import Any
 
-from backend.database import get_connection
+from backend.database import db_session
 from shared.exceptions import MemberNotFound
 
 
-def get_member(member_id):
-    """Full account profile. Raises MemberNotFound if no such member."""
-    conn = get_connection()
+def _require_member(conn, member_id: str):
     row = conn.execute(
         "SELECT * FROM accounts WHERE member_id = ?", (member_id,)
     ).fetchone()
-    conn.close()
     if row is None:
-        raise MemberNotFound(member_id)
-    return dict(row)
+        raise MemberNotFound(f"No account for member '{member_id}'.")
+    return row
 
 
-def get_balance(member_id):
-    """Balance, credit limit, and utilisation."""
-    conn = get_connection()
-    row = conn.execute(
-        "SELECT balance, credit_limit, utilisation FROM accounts WHERE member_id = ?",
-        (member_id,),
-    ).fetchone()
-    conn.close()
-    return dict(row) if row else None
+def get_member(member_id: str) -> dict[str, Any]:
+    """Full account profile."""
+    with db_session() as conn:
+        row = _require_member(conn, member_id)
+        return dict(row)
 
 
-def get_waiver_history(member_id, months=12):
-    """Courtesy waivers within the last `months`, newest first."""
-    # ponytail: ~30 days/month is close enough for policy windows; swap for
-    # dateutil.relativedelta if exact calendar months ever matter.
+def get_balance(member_id: str) -> dict[str, Any]:
+    """Current balance and credit limit."""
+    with db_session() as conn:
+        row = _require_member(conn, member_id)
+        return {
+            "balance": row["balance"],
+            "credit_limit": row["credit_limit"],
+            "utilisation": row["utilisation"],
+        }
+
+
+def get_waiver_history(member_id: str, months: int = 8) -> list[dict[str, Any]]:
+    """Courtesy waivers within a trailing time window."""
     cutoff = (datetime.now(timezone.utc) - timedelta(days=30 * months)).isoformat()
-    conn = get_connection()
-    rows = conn.execute(
-        "SELECT * FROM waiver_history WHERE member_id = ? AND waived_at >= ?"
-        " ORDER BY waived_at DESC",
-        (member_id, cutoff),
-    ).fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
+    with db_session() as conn:
+        _require_member(conn, member_id)
+        rows = conn.execute(
+            "SELECT * FROM waiver_history WHERE member_id = ? AND date >= ? ORDER BY date DESC",
+            (member_id, cutoff),
+        ).fetchall()
+        return [dict(r) for r in rows]
 
 
-def get_transactions(member_id, limit=10):
-    """Recent charges, newest first."""
-    conn = get_connection()
-    rows = conn.execute(
-        "SELECT * FROM transactions WHERE member_id = ? ORDER BY posted_at DESC"
-        " LIMIT ?",
-        (member_id, limit),
-    ).fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
+def get_transactions(member_id: str, limit: int = 10) -> list[dict[str, Any]]:
+    """Recent charge history."""
+    with db_session() as conn:
+        _require_member(conn, member_id)
+        rows = conn.execute(
+            "SELECT * FROM transactions WHERE member_id = ? ORDER BY date DESC LIMIT ?",
+            (member_id, limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
 
 
-def get_income_data(member_id):
-    """Income amount, the date it was recorded, and how many months stale."""
-    conn = get_connection()
-    row = conn.execute(
-        "SELECT income_amount, income_asof FROM accounts WHERE member_id = ?",
-        (member_id,),
-    ).fetchone()
-    conn.close()
-    if row is None:
-        return None
-
-    data = dict(row)
-    data["months_stale"] = None
-    if data["income_asof"]:
-        asof = datetime.fromisoformat(data["income_asof"])
-        if asof.tzinfo is None:
-            asof = asof.replace(tzinfo=timezone.utc)
-        days = (datetime.now(timezone.utc) - asof).days
-        data["months_stale"] = days // 30
-    return data
+def get_income_data(member_id: str) -> dict[str, Any]:
+    """Income staleness signal used by the credit policy."""
+    with db_session() as conn:
+        row = _require_member(conn, member_id)
+        return {"income_staleness_months": row["income_staleness_months"]}
 
 
-if __name__ == "__main__":
-    # Self-check: seed one member with a recent + an old waiver, read back.
-    import os
+def get_account_facts(member_id: str, distress_signals: bool = False) -> dict[str, Any]:
+    """Flatten the account into the fact dict the policy engine consumes.
 
-    import backend.database as db
+    This is the single read-only surface `nodes.run_policy` uses to build the
+    input to `policy_engine.evaluate`. Everything the policies reference by
+    `field` name must be present here.
+    """
+    with db_session() as conn:
+        row = _require_member(conn, member_id)
+        waivers_8m = conn.execute(
+            """SELECT COUNT(*) AS n FROM waiver_history
+               WHERE member_id = ? AND date >= ?""",
+            (
+                member_id,
+                (datetime.now(timezone.utc) - timedelta(days=30 * 8)).isoformat(),
+            ),
+        ).fetchone()["n"]
+        replacements_30d = conn.execute(
+            """SELECT COUNT(*) AS n FROM transactions
+               WHERE member_id = ? AND kind = 'replacement' AND date >= ?""",
+            (
+                member_id,
+                (datetime.now(timezone.utc) - timedelta(days=30)).isoformat(),
+            ),
+        ).fetchone()["n"]
 
-    db.DB_PATH = "_accounts_selfcheck.db"
-    if os.path.exists(db.DB_PATH):
-        os.remove(db.DB_PATH)
-    db.init_db()
-
-    recent = (datetime.now(timezone.utc) - timedelta(days=60)).isoformat()
-    old = (datetime.now(timezone.utc) - timedelta(days=400)).isoformat()
-
-    conn = get_connection()
-    conn.execute("INSERT INTO accounts (member_id, name, tenure_months, balance,"
-                 " credit_limit, income_amount, income_asof) VALUES"
-                 " ('M1', 'Ananya', 6, 200, 5000, 60000, ?)", (old,))
-    conn.execute("INSERT INTO transactions (txn_ref, member_id, posted_at, amount,"
-                 " description) VALUES ('TXN-1', 'M1', '2026-06-01', 500, 'late fee')")
-    conn.execute("INSERT INTO waiver_history (member_id, waived_at, amount,"
-                 " policy_version) VALUES ('M1', ?, 500, 'v1')", (recent,))
-    conn.execute("INSERT INTO waiver_history (member_id, waived_at, amount,"
-                 " policy_version) VALUES ('M1', ?, 500, 'v1')", (old,))
-    conn.commit()
-    conn.close()
-
-    assert get_member("M1")["name"] == "Ananya"
-    try:
-        get_member("NOPE")
-        assert False, "missing member must raise"
-    except MemberNotFound:
-        pass
-    assert get_balance("M1")["credit_limit"] == 5000
-    assert len(get_transactions("M1")) == 1
-    # 6-month window catches the recent waiver, not the 400-day-old one.
-    assert len(get_waiver_history("M1", months=6)) == 1
-    assert len(get_waiver_history("M1", months=24)) == 2
-    assert get_income_data("M1")["months_stale"] >= 13
-
-    os.remove(db.DB_PATH)
-    print("accounts self-check passed.")
+        return {
+            "member_id": row["member_id"],
+            "tenure_months": row["tenure_months"],
+            "late_payments_12m": row["late_payments_12m"],
+            "prior_waivers_8m": waivers_8m,
+            "income_staleness_months": row["income_staleness_months"],
+            "utilisation": row["utilisation"],
+            "fraud_hold": bool(row["fraud_hold"]),
+            "replacements_30d": replacements_30d,
+            "distress_signals": distress_signals,
+        }

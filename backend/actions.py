@@ -1,242 +1,233 @@
-"""
-backend/actions.py
+"""backend/actions.py — write-side of the fake core banking system.
 
-Write-side. The only file that changes account data and the only file that
-calls ledger.append().
+Owned by Person B. Every function performs one ATOMIC, SERIALISED unit of work
+inside a single write_transaction():
+  1. Check the idempotency key — if already processed with the same inputs,
+     return the original result. Same key + different inputs → IdempotencyConflict.
+  2. Mutate the relevant table(s).
+  3. Append the hash-chained ledger row (via ledger.append_on_conn, same txn).
+  4. Record the idempotency key.
+All four steps commit together or roll back together. Because the transaction
+holds the write lock from the start (BEGIN IMMEDIATE), the ledger's
+read-latest-hash-then-insert can never interleave with another action, so the
+chain cannot fork under concurrency.
 
-Every function follows the same 4 steps:
-    1. Check idempotency key -> if seen before, return the old result.
-    2. Change the table(s).
-    3. Write a proof row to the audit ledger.
-    4. Return a receipt (dict).
+This is the SOLE ledger writer in the codebase. No other file appends.
+
+Imports: backend.database, backend.ledger, shared.schemas, shared.exceptions.
 """
+from __future__ import annotations
 
 import hashlib
 import json
 import uuid
 from datetime import datetime, timezone
+from typing import Any, Callable, Optional
 
-from backend.database import get_connection
-from backend.ledger import _canonical, append
+from backend import ledger
+from backend.database import write_transaction
 from shared.exceptions import IdempotencyConflict
+from shared.schemas import Receipt
 
 
-def _hash_inputs(inputs):
-    return hashlib.sha256(_canonical(inputs).encode()).hexdigest()
+def _inputs_hash(inputs: dict[str, Any]) -> str:
+    return hashlib.sha256(
+        json.dumps(inputs, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
 
 
-def _check_idempotency(key, inputs):
-    """Return the stored result if this key ran before, else None.
-    Same key + different inputs is a bug, so raise."""
-    conn = get_connection()
-    row = conn.execute(
-        "SELECT inputs_hash, result FROM idempotency_keys WHERE idempotency_key = ?",
-        (key,),
-    ).fetchone()
-    conn.close()
-    if row is None:
-        return None
-    if row["inputs_hash"] != _hash_inputs(inputs):
-        raise IdempotencyConflict(f"key reused with different inputs: {key}")
-    return json.loads(row["result"])
+def _ref(prefix: str) -> str:
+    return f"{prefix}-{uuid.uuid4().hex[:8].upper()}"
 
 
-def _record_idempotency(key, action, inputs, result):
-    conn = get_connection()
-    conn.execute(
-        "INSERT INTO idempotency_keys (idempotency_key, action, inputs_hash,"
-        " result, created_at) VALUES (?, ?, ?, ?, ?)",
-        (key, action, _hash_inputs(inputs), _canonical(result),
-         datetime.now(timezone.utc).isoformat()),
-    )
-    conn.commit()
-    conn.close()
+def _execute(
+    idempotency_key: str,
+    inputs: dict[str, Any],
+    action_name: str,
+    decision: Optional[dict[str, Any]],
+    session_id: Optional[str],
+    work: Callable[[Any], Receipt],
+) -> Receipt:
+    """Run one write action atomically and exactly once.
+
+    `work(conn)` performs the table mutation on the shared transaction and
+    returns the Receipt. The idempotency check, the ledger append, and the
+    idempotency record all happen on the SAME connection/transaction, so a
+    crash can never leave a mutation without its ledger row (or a completed
+    action without its idempotency guard).
+    """
+    ih = _inputs_hash(inputs)
+    with write_transaction() as conn:
+        existing = conn.execute(
+            "SELECT inputs_hash, result FROM idempotency_keys WHERE key = ?",
+            (idempotency_key,),
+        ).fetchone()
+        if existing is not None:
+            if existing["inputs_hash"] != ih:
+                raise IdempotencyConflict(
+                    f"Idempotency key '{idempotency_key}' reused with different inputs."
+                )
+            return Receipt(**json.loads(existing["result"]))
+
+        receipt = work(conn)
+        ledger.append_on_conn(conn, "system", action_name, inputs, decision, session_id)
+        conn.execute(
+            "INSERT INTO idempotency_keys (key, inputs_hash, result, created_at) VALUES (?, ?, ?, ?)",
+            (idempotency_key, ih, receipt.model_dump_json(),
+             datetime.now(timezone.utc).isoformat()),
+        )
+        return receipt
 
 
-def _ref():
-    return "REF-" + uuid.uuid4().hex[:8].upper()
-
-
-def _receipt(action, amount=None, new_balance=None, detail=None, reference=None):
-    """Shape matches shared.schemas.Receipt (dict until Pydantic lands)."""
-    return {
-        "reference": reference or _ref(),
-        "action": action,
-        "amount": amount,
-        "currency": "INR",
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "new_balance": new_balance,
-        "detail": detail,
-    }
-
-
-def _balance(conn, member_id):
-    row = conn.execute(
-        "SELECT balance FROM accounts WHERE member_id = ?", (member_id,)
-    ).fetchone()
-    return row["balance"] if row else None
-
-
-# --- The write actions ------------------------------------------------------
-
-def reverse_fee(member_id, fee_amount, txn_ref, decision, idempotency_key):
+# --------------------------------------------------------------------------- #
+# Write actions
+# --------------------------------------------------------------------------- #
+def reverse_fee(
+    member_id: str,
+    fee_amount: float,
+    txn_ref: str,
+    decision: dict[str, Any],
+    idempotency_key: str,
+    session_id: Optional[str] = None,
+) -> Receipt:
     inputs = {"member_id": member_id, "fee_amount": fee_amount, "txn_ref": txn_ref}
-    cached = _check_idempotency(idempotency_key, inputs)
-    if cached:
-        return cached
 
-    conn = get_connection()
-    conn.execute(
-        "UPDATE transactions SET reversed = 1 WHERE txn_ref = ? AND member_id = ?",
-        (txn_ref, member_id),
-    )
-    conn.execute(
-        "UPDATE accounts SET balance = balance - ? WHERE member_id = ?",
-        (fee_amount, member_id),
-    )
-    new_balance = _balance(conn, member_id)
-    conn.commit()
-    conn.close()
+    def work(conn) -> Receipt:
+        conn.execute(
+            "UPDATE accounts SET balance = balance - ? WHERE member_id = ?",
+            (fee_amount, member_id),
+        )
+        conn.execute(
+            "UPDATE transactions SET reversed = 1 WHERE txn_ref = ?", (txn_ref,)
+        )
+        new_balance = conn.execute(
+            "SELECT balance FROM accounts WHERE member_id = ?", (member_id,)
+        ).fetchone()["balance"]
+        return Receipt(
+            reference=_ref("TXN"),
+            action="reverse_fee",
+            amount=fee_amount,
+            new_balance=new_balance,
+            detail=f"Late fee of {fee_amount} reversed against {txn_ref}; statement recalculated.",
+        )
 
-    append("agent", "reverse_fee", inputs, decision)
-    receipt = _receipt("reverse_fee", amount=fee_amount, new_balance=new_balance,
-                       detail=f"Late fee reversed on {txn_ref}")
-    _record_idempotency(idempotency_key, "reverse_fee", inputs, receipt)
-    return receipt
+    return _execute(idempotency_key, inputs, "reverse_fee", decision, session_id, work)
 
 
-def block_card(member_id, card_id, reason, idempotency_key):
+def block_card(
+    member_id: str,
+    card_id: str,
+    reason: str,
+    idempotency_key: str,
+    session_id: Optional[str] = None,
+) -> Receipt:
     inputs = {"member_id": member_id, "card_id": card_id, "reason": reason}
-    cached = _check_idempotency(idempotency_key, inputs)
-    if cached:
-        return cached
 
-    conn = get_connection()
-    conn.execute(
-        "UPDATE accounts SET card_status = 'blocked' WHERE member_id = ?",
-        (member_id,),
-    )
-    conn.commit()
-    conn.close()
+    def work(conn) -> Receipt:
+        conn.execute(
+            "UPDATE accounts SET card_status = 'blocked' WHERE member_id = ?",
+            (member_id,),
+        )
+        return Receipt(
+            reference=_ref("BLK"),
+            action="block_card",
+            detail=f"Card {card_id} blocked ({reason}).",
+        )
 
-    append("agent", "block_card", inputs, {"outcome": "APPROVE"})
-    receipt = _receipt("block_card",
-                       detail=f"Card {card_id} blocked: {reason}")
-    _record_idempotency(idempotency_key, "block_card", inputs, receipt)
-    return receipt
+    return _execute(idempotency_key, inputs, "block_card", None, session_id, work)
 
 
-def issue_replacement(member_id, card_id, idempotency_key):
+def issue_replacement(
+    member_id: str,
+    card_id: str,
+    idempotency_key: str,
+    session_id: Optional[str] = None,
+) -> Receipt:
     inputs = {"member_id": member_id, "card_id": card_id}
-    cached = _check_idempotency(idempotency_key, inputs)
-    if cached:
-        return cached
 
-    conn = get_connection()
-    conn.execute(
-        "UPDATE accounts SET card_status = 'replacement_issued' WHERE member_id = ?",
-        (member_id,),
-    )
-    conn.commit()
-    conn.close()
+    def work(conn) -> Receipt:
+        new_ref = _ref("CARD")
+        conn.execute(
+            """INSERT INTO transactions (txn_ref, member_id, date, amount, description, kind)
+               VALUES (?, ?, ?, 0, ?, 'replacement')""",
+            (
+                new_ref,
+                member_id,
+                datetime.now(timezone.utc).isoformat(),
+                f"Replacement card issued for {card_id}",
+            ),
+        )
+        return Receipt(
+            reference=new_ref,
+            action="issue_replacement",
+            detail=f"Replacement card issued for {card_id}. Arrives in 5–7 business days.",
+        )
 
-    append("agent", "issue_replacement", inputs, {"outcome": "APPROVE"})
-    new_card_ref = _ref()
-    receipt = _receipt("issue_replacement", reference=new_card_ref,
-                       detail=f"Replacement issued for {card_id}")
-    _record_idempotency(idempotency_key, "issue_replacement", inputs, receipt)
-    return receipt
+    return _execute(idempotency_key, inputs, "issue_replacement", None, session_id, work)
 
 
-def adjust_credit_limit(member_id, new_limit, decision, idempotency_key):
+def adjust_credit_limit(
+    member_id: str,
+    new_limit: float,
+    decision: dict[str, Any],
+    idempotency_key: str,
+    session_id: Optional[str] = None,
+) -> Receipt:
     inputs = {"member_id": member_id, "new_limit": new_limit}
-    cached = _check_idempotency(idempotency_key, inputs)
-    if cached:
-        return cached
 
-    conn = get_connection()
-    conn.execute(
-        "UPDATE accounts SET credit_limit = ? WHERE member_id = ?",
-        (new_limit, member_id),
-    )
-    conn.commit()
-    conn.close()
+    def work(conn) -> Receipt:
+        conn.execute(
+            "UPDATE accounts SET credit_limit = ? WHERE member_id = ?",
+            (new_limit, member_id),
+        )
+        return Receipt(
+            reference=_ref("LMT"),
+            action="adjust_credit_limit",
+            amount=new_limit,
+            detail=f"Credit limit updated to {new_limit}.",
+        )
 
-    append("agent", "adjust_credit_limit", inputs, decision)
-    receipt = _receipt("adjust_credit_limit", amount=new_limit,
-                       detail=f"Credit limit set to {new_limit}")
-    _record_idempotency(idempotency_key, "adjust_credit_limit", inputs, receipt)
-    return receipt
+    return _execute(idempotency_key, inputs, "adjust_credit_limit", decision, session_id, work)
 
 
-def open_underwriting_case(member_id, request_type, decision, idempotency_key):
+def open_underwriting_case(
+    member_id: str,
+    request_type: str,
+    decision: dict[str, Any],
+    idempotency_key: str,
+    session_id: Optional[str] = None,
+) -> Receipt:
     inputs = {"member_id": member_id, "request_type": request_type}
-    cached = _check_idempotency(idempotency_key, inputs)
-    if cached:
-        return cached
+    case_ref = _ref("CASE")
 
-    # No cases table (out of scope) — the ledger row IS the queued case.
-    append("agent", "open_underwriting_case", inputs, decision)
-    receipt = _receipt("open_underwriting_case",
-                       detail=f"Underwriting case queued for {request_type}")
-    _record_idempotency(idempotency_key, "open_underwriting_case", inputs, receipt)
-    return receipt
+    def work(conn) -> Receipt:
+        # No cases table (out of scope) — the ledger row IS the queued case.
+        return Receipt(
+            reference=case_ref,
+            action="open_underwriting_case",
+            detail=f"Underwriting case {case_ref} opened for {request_type}.",
+        )
+
+    return _execute(idempotency_key, inputs, "open_underwriting_case", decision, session_id, work)
 
 
-def flag_vulnerability(member_id, signals, idempotency_key):
+def flag_vulnerability(
+    member_id: str,
+    signals: list[str],
+    idempotency_key: str,
+    session_id: Optional[str] = None,
+) -> Receipt:
     inputs = {"member_id": member_id, "signals": signals}
-    cached = _check_idempotency(idempotency_key, inputs)
-    if cached:
-        return cached
 
-    conn = get_connection()
-    conn.execute(
-        "UPDATE accounts SET vulnerability = 1 WHERE member_id = ?", (member_id,)
-    )
-    conn.commit()
-    conn.close()
+    def work(conn) -> Receipt:
+        conn.execute(
+            "UPDATE accounts SET vulnerability_flag = 1 WHERE member_id = ?",
+            (member_id,),
+        )
+        return Receipt(
+            reference=_ref("VUL"),
+            action="flag_vulnerability",
+            detail="Account flagged for sensitive handling; collections activity suppressed.",
+        )
 
-    append("agent", "flag_vulnerability", inputs, {"outcome": "ESCALATE"})
-    receipt = _receipt("flag_vulnerability",
-                       detail="Vulnerability flagged; collections suppressed")
-    _record_idempotency(idempotency_key, "flag_vulnerability", inputs, receipt)
-    return receipt
-
-
-if __name__ == "__main__":
-    # Self-check: fee reverses once, idempotency blocks the double, ledger clean.
-    import os
-
-    import backend.database as db
-    from backend.ledger import verify
-
-    db.DB_PATH = "_actions_selfcheck.db"
-    if os.path.exists(db.DB_PATH):
-        os.remove(db.DB_PATH)
-    db.init_db()
-
-    conn = get_connection()
-    conn.execute("INSERT INTO accounts (member_id, name, tenure_months, balance)"
-                 " VALUES ('M1', 'Priya', 36, 1000)")
-    conn.execute("INSERT INTO transactions (txn_ref, member_id, posted_at, amount,"
-                 " description) VALUES ('TXN-1', 'M1', '2026-01-01', 500, 'late fee')")
-    conn.commit()
-    conn.close()
-
-    decision = {"outcome": "APPROVE", "policy": "fee.late.courtesy_waiver.v1"}
-    r1 = reverse_fee("M1", 500, "TXN-1", decision, idempotency_key="k1")
-    assert r1["new_balance"] == 500, r1
-
-    # Same key again: must return same receipt, must NOT subtract twice.
-    r2 = reverse_fee("M1", 500, "TXN-1", decision, idempotency_key="k1")
-    assert r2 == r1, "idempotent replay must match"
-
-    conn = get_connection()
-    bal = _balance(conn, "M1")
-    conn.close()
-    assert bal == 500, f"balance double-charged: {bal}"
-
-    assert verify()["status"] == "OK"
-
-    os.remove(db.DB_PATH)
-    print("actions self-check passed. balance:", bal, "| receipt:", r1["reference"])
+    return _execute(idempotency_key, inputs, "flag_vulnerability", None, session_id, work)

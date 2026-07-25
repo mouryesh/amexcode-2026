@@ -1,121 +1,172 @@
-"""
-backend/database.py
+"""backend/database.py — SQLite engine, connections, and table DDL.
 
-Opens the SQLite database and creates the tables. That's it.
-Every other backend file calls get_connection() to read/write.
+Owned by Person B. The append-only constraint on `audit_ledger` is enforced
+here at the access layer: no function anywhere constructs an UPDATE or DELETE
+against it. There is deliberately no such code path in this file.
 
-Note: the audit_ledger table is append-only. Nothing here ever writes an
-UPDATE or DELETE against it, so history cannot be quietly changed.
+Imports: shared.config only.
 """
+from __future__ import annotations
 
 import sqlite3
+from contextlib import contextmanager
+from typing import Iterator
 
-# Where the SQLite file lives. Handoff contract: shared/config.py exposes a
-# single `config` object with config.DB_PATH. Until that file exists, default
-# to a local file.
-try:
-    from shared.config import config
-    DB_PATH = config.DB_PATH
-except ImportError:
-    DB_PATH = "servicing.db"
+from shared.config import config
 
-
-SCHEMA = """
+_SCHEMA = """
 CREATE TABLE IF NOT EXISTS accounts (
-    member_id      TEXT PRIMARY KEY,
-    name           TEXT    NOT NULL,
-    email          TEXT,
-    phone          TEXT,
-    tenure_months  INTEGER NOT NULL,
-    balance        REAL    NOT NULL DEFAULT 0,
-    credit_limit   REAL    NOT NULL DEFAULT 0,
-    utilisation    REAL    NOT NULL DEFAULT 0,
-    income_amount  REAL,
-    income_asof    TEXT,                       -- ISO date, to spot stale income
-    card_status    TEXT    NOT NULL DEFAULT 'active',
-    vulnerability  INTEGER NOT NULL DEFAULT 0  -- 0/1 flag
+    member_id             TEXT PRIMARY KEY,
+    name                  TEXT NOT NULL,
+    tenure_months         INTEGER NOT NULL,
+    balance               REAL NOT NULL,
+    credit_limit          REAL NOT NULL,
+    late_payments_12m     INTEGER NOT NULL DEFAULT 0,
+    income_staleness_months INTEGER NOT NULL DEFAULT 0,
+    utilisation           REAL NOT NULL DEFAULT 0.0,
+    card_id               TEXT,
+    card_status           TEXT NOT NULL DEFAULT 'active',
+    fraud_hold            INTEGER NOT NULL DEFAULT 0,
+    vulnerability_flag    INTEGER NOT NULL DEFAULT 0,
+    email                 TEXT,
+    phone                 TEXT
 );
 
 CREATE TABLE IF NOT EXISTS transactions (
-    txn_ref      TEXT PRIMARY KEY,
-    member_id    TEXT    NOT NULL,
-    posted_at    TEXT    NOT NULL,
-    amount       REAL    NOT NULL,
-    description  TEXT    NOT NULL,
-    category     TEXT,
-    reversed     INTEGER NOT NULL DEFAULT 0
+    txn_ref     TEXT PRIMARY KEY,
+    member_id   TEXT NOT NULL,
+    date        TEXT NOT NULL,
+    amount      REAL NOT NULL,
+    description TEXT NOT NULL,
+    kind        TEXT NOT NULL DEFAULT 'charge',
+    reversed    INTEGER NOT NULL DEFAULT 0,
+    FOREIGN KEY (member_id) REFERENCES accounts(member_id)
 );
 
 CREATE TABLE IF NOT EXISTS waiver_history (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
     member_id      TEXT NOT NULL,
-    waived_at      TEXT NOT NULL,
-    amount         REAL NOT NULL,
-    policy_version TEXT NOT NULL
+    date           TEXT NOT NULL,
+    fee_amount     REAL NOT NULL,
+    policy_version TEXT NOT NULL,
+    FOREIGN KEY (member_id) REFERENCES accounts(member_id)
 );
 
--- Append-only, hash-chained. prev_hash links each row to the one before it.
+-- Append-only, hash-chained. No UPDATE or DELETE path exists for this table.
 CREATE TABLE IF NOT EXISTS audit_ledger (
-    record_id    INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_id   TEXT,
-    timestamp    TEXT NOT NULL,
-    actor        TEXT NOT NULL,
-    action       TEXT NOT NULL,
-    inputs       TEXT NOT NULL,   -- canonical JSON
-    decision     TEXT,            -- canonical JSON, nullable (AuditRecord: dict | None)
-    prev_hash    TEXT NOT NULL,
-    record_hash  TEXT NOT NULL UNIQUE
+    record_id   INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id  TEXT,
+    timestamp   TEXT NOT NULL,
+    actor       TEXT NOT NULL,
+    action      TEXT NOT NULL,
+    inputs      TEXT NOT NULL,
+    decision    TEXT,
+    prev_hash   TEXT NOT NULL,
+    record_hash TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS idempotency_keys (
-    idempotency_key TEXT PRIMARY KEY,
-    action          TEXT NOT NULL,
-    inputs_hash     TEXT NOT NULL,
-    result          TEXT NOT NULL,   -- canonical JSON of the original result
-    created_at      TEXT NOT NULL
+    key         TEXT PRIMARY KEY,
+    inputs_hash TEXT NOT NULL,
+    result      TEXT NOT NULL,
+    created_at  TEXT NOT NULL
 );
 
--- Turn-by-turn transcript: member queries + model replies.
--- Kept separate from audit_ledger so the ledger stays "one row = one decision".
+-- Turn-by-turn transcript, per session. Kept separate from audit_ledger so the
+-- ledger stays "one row = one decision". Lets the agent thread prior turns into
+-- a fresh AgentState (real transcript, real cross-turn sentiment) and detect
+-- repeated-request patterns (e.g. the same decline asked again).
+--
+-- RECONCILED SCHEMA (see BACKEND_RECONCILIATION.md): a superset of the two
+-- parallel conversation tables that existed on the mouryesh and Yash_Amex
+-- branches. Adopts the Yash_Amex column names (turn_index, role, content,
+-- intent, confidence, created_at) so both people's code writes the same shape,
+-- and keeps the decision-tracking columns the repeat-decline escalation needs
+-- (decision_outcome, decision_reason_code, policy_id).
 CREATE TABLE IF NOT EXISTS messages (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_id  TEXT    NOT NULL,
-    member_id   TEXT,
-    turn_index  INTEGER NOT NULL,
-    role        TEXT    NOT NULL,   -- 'member' | 'agent' | 'system'
-    content     TEXT    NOT NULL,
-    intent      TEXT,
-    confidence  REAL,
-    created_at  TEXT    NOT NULL
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id           TEXT    NOT NULL,
+    member_id            TEXT,
+    turn_index           INTEGER NOT NULL,
+    role                 TEXT    NOT NULL,   -- 'member' | 'agent' | 'system'
+    content              TEXT    NOT NULL,
+    intent               TEXT,
+    confidence           REAL,
+    decision_outcome     TEXT,
+    decision_reason_code TEXT,
+    policy_id            TEXT,
+    created_at           TEXT    NOT NULL
 );
 
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages (session_id, turn_index);
 """
 
 
-def get_connection():
-    """Open a connection. Rows come back dict-like (row["name"])."""
-    conn = sqlite3.connect(DB_PATH)
+def get_connection() -> sqlite3.Connection:
+    """Open a connection with row access by column name and FKs enforced."""
+    conn = sqlite3.connect(config.DB_PATH)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    # WAL lets readers run concurrently with the single writer; busy_timeout
+    # makes a second writer WAIT for the lock (up to 5s) instead of immediately
+    # raising "database is locked". Together with write_transaction()'s
+    # BEGIN IMMEDIATE, this serialises writes cleanly under concurrency.
+    conn.execute("PRAGMA busy_timeout = 5000")
+    conn.execute("PRAGMA journal_mode = WAL")
     return conn
 
 
-def init_db():
-    """Create every table if it doesn't already exist. Safe to run repeatedly."""
+@contextmanager
+def db_session() -> Iterator[sqlite3.Connection]:
+    """Transactional connection context manager: commit on success, rollback on error.
+
+    Used for reads and standalone writes. For the atomic action path (mutate +
+    ledger append + idempotency, all-or-nothing, serialised) use
+    write_transaction() instead.
+    """
     conn = get_connection()
-    conn.executescript(SCHEMA)
-    conn.commit()
-    conn.close()
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
-def tables_are_empty():
-    """True if there are no accounts yet — used to decide whether to seed."""
+@contextmanager
+def write_transaction() -> Iterator[sqlite3.Connection]:
+    """A single serialised, all-or-nothing write transaction.
+
+    Issues BEGIN IMMEDIATE, which acquires the write lock UP FRONT — before any
+    read in the transaction body. This is what makes the ledger's
+    read-latest-hash-then-insert safe under concurrency: no other writer can
+    slip an append in between, so the hash chain can never fork. Everything in
+    the body commits together or rolls back together, so an account mutation,
+    its ledger row, and its idempotency record are never left partially written.
+    """
     conn = get_connection()
-    count = conn.execute("SELECT COUNT(*) FROM accounts").fetchone()[0]
-    conn.close()
-    return count == 0
+    conn.isolation_level = None  # take manual control of BEGIN/COMMIT/ROLLBACK
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        yield conn
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.close()
 
 
-if __name__ == "__main__":
-    init_db()
-    print("Database ready at", DB_PATH)
+def init_db() -> None:
+    """Create tables if they do not exist. Safe to call repeatedly."""
+    with db_session() as conn:
+        conn.executescript(_SCHEMA)
+
+
+def tables_empty() -> bool:
+    """True when there are no accounts yet — used to gate seeding on startup."""
+    with db_session() as conn:
+        row = conn.execute("SELECT COUNT(*) AS n FROM accounts").fetchone()
+        return row["n"] == 0
