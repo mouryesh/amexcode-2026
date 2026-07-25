@@ -11,7 +11,7 @@ import hashlib
 import json
 from typing import Any, Optional
 
-from backend.database import db_session
+from backend.database import db_session, write_transaction
 
 _GENESIS = "0" * 64
 
@@ -50,6 +50,50 @@ def _latest_hash(conn) -> str:
     return row["record_hash"] if row else _GENESIS
 
 
+def append_on_conn(
+    conn,
+    actor: str,
+    action: str,
+    inputs: dict[str, Any],
+    decision: Optional[dict[str, Any]] = None,
+    session_id: Optional[str] = None,
+) -> dict[str, Any]:
+    """Append one hash-chained record ON AN EXISTING (write-locked) transaction.
+
+    This is the atomic building block: backend/actions.py calls it inside its
+    own write_transaction() so the account mutation and this ledger row commit
+    together. The caller MUST hold the write lock (BEGIN IMMEDIATE) so the
+    read-latest-hash-then-insert below cannot interleave with another append.
+    Does NOT commit — the caller's transaction owns that.
+    """
+    from datetime import datetime, timezone
+
+    timestamp = datetime.now(timezone.utc).isoformat()
+    prev_hash = _latest_hash(conn)
+    record_hash = _compute_hash(prev_hash, timestamp, actor, action, inputs, decision)
+    cur = conn.execute(
+        """INSERT INTO audit_ledger
+           (session_id, timestamp, actor, action, inputs, decision, prev_hash, record_hash)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            session_id,
+            timestamp,
+            actor,
+            action,
+            _canonical(inputs),
+            _canonical(decision) if decision is not None else None,
+            prev_hash,
+            record_hash,
+        ),
+    )
+    return {
+        "record_id": cur.lastrowid,
+        "timestamp": timestamp,
+        "record_hash": record_hash,
+        "prev_hash": prev_hash,
+    }
+
+
 def append(
     actor: str,
     action: str,
@@ -57,39 +101,15 @@ def append(
     decision: Optional[dict[str, Any]] = None,
     session_id: Optional[str] = None,
 ) -> dict[str, Any]:
-    """Append one hash-chained record. Append only — no update path exists.
+    """Append one hash-chained record in its own serialised transaction.
+
+    Standalone entry point (tests, ad-hoc use). For the atomic action path the
+    write goes through append_on_conn() on the caller's transaction instead.
 
     record_hash = sha256(prev_hash + timestamp + actor + action + inputs + decision)
     """
-    from datetime import datetime, timezone
-
-    timestamp = datetime.now(timezone.utc).isoformat()
-    with db_session() as conn:
-        prev_hash = _latest_hash(conn)
-        record_hash = _compute_hash(
-            prev_hash, timestamp, actor, action, inputs, decision
-        )
-        cur = conn.execute(
-            """INSERT INTO audit_ledger
-               (session_id, timestamp, actor, action, inputs, decision, prev_hash, record_hash)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (
-                session_id,
-                timestamp,
-                actor,
-                action,
-                _canonical(inputs),
-                _canonical(decision) if decision is not None else None,
-                prev_hash,
-                record_hash,
-            ),
-        )
-        return {
-            "record_id": cur.lastrowid,
-            "timestamp": timestamp,
-            "record_hash": record_hash,
-            "prev_hash": prev_hash,
-        }
+    with write_transaction() as conn:
+        return append_on_conn(conn, actor, action, inputs, decision, session_id)
 
 
 def verify() -> dict[str, Any]:

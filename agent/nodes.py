@@ -14,7 +14,8 @@ from agent.classifier import classify, is_hardship
 from agent.llm import LLMUnavailable, llm
 from agent.policy_engine import evaluate
 from agent.state import AgentState
-from backend import accounts
+from backend import accounts, sessions
+from shared.config import config
 from shared.schemas import Intent, Outcome
 
 # The slots a member must supply (directly or via auto-resolution from the read
@@ -121,10 +122,33 @@ def check_slots(state: AgentState) -> AgentState:
 
 
 def run_policy(state: AgentState) -> AgentState:
-    """Evaluate the policy for this intent; append the Decision to state."""
+    """Evaluate the policy for this intent; append the Decision to state.
+
+    The policy engine itself stays a pure function of account facts (no DB, no
+    session awareness). Session-pattern overrides — like "this is the second
+    identical decline this session" — are applied here, in the orchestration
+    layer, not inside policy_engine.py.
+    """
     intent = state["intent"].label
     policy_id = tools.INTENT_POLICY[intent]
     decision = evaluate(policy_id, state["account_facts"])
+
+    if decision.outcome == Outcome.DECLINE:
+        prior_declines = sessions.count_prior_declines(
+            state["session_id"], policy_id, decision.reason_code
+        )
+        if prior_declines >= config.DECLINE_REPEAT_ESCALATE_THRESHOLD:
+            decision = decision.model_copy(update={
+                "outcome": Outcome.ESCALATE,
+                "reason_code": "REPEATED_DECLINE_ESCALATED",
+                "reason_text": (
+                    "You've asked about this more than once, so rather than "
+                    "decline again I'm connecting you with a specialist who can "
+                    "take a closer look at your situation."
+                ),
+                "rule_id": "repeat_decline_escalation",
+            })
+
     state["decision_records"] = state.get("decision_records", []) + [decision]
     return state
 

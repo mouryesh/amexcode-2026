@@ -4,15 +4,22 @@ Task 1 of the problem statement, as a named, measurable component. Maps to one
 of the 12 taxonomy categories. Below the confidence threshold in config it
 returns 'clarify' and never guesses.
 
-Online: calls the LLM via llm.py with a strict JSON schema.
-Offline: a deterministic keyword/heuristic classifier so the graph runs and the
-classifier test set is reproducible without an API key.
+Three layers, tried in order:
+  1. LLM (llm.py), if a provider is configured — strict JSON schema.
+  2. Trained ML classifier (local sentence-transformer embeddings ->
+     Logistic Regression, see scripts/train_classifier.py) — the offline
+     default. Needs internet ONCE to download the embedding model weights
+     (~80MB, then cached locally); no LLM API key, no network per-request.
+  3. Keyword heuristic — last-resort fallback if the ML artifact or
+     sentence-transformers isn't available in this environment, so the graph
+     never hard-fails on a missing optional dependency.
 
 Imports: llm, shared.schemas, shared.config.
 """
 from __future__ import annotations
 
-import re
+from pathlib import Path
+from typing import Any, Optional
 
 from agent.llm import LLMUnavailable, llm
 from shared.config import config
@@ -76,7 +83,7 @@ _SCHEMA_HINT = '{"label": "<one category>", "confidence": <0.0-1.0>, "rationale"
 
 
 def _heuristic(message: str) -> Intent:
-    """Deterministic offline classifier used when no LLM is configured."""
+    """Deterministic keyword classifier — last-resort fallback only."""
     text = message.lower()
     for label, keywords in _HEURISTICS:
         for kw in keywords:
@@ -89,6 +96,72 @@ def _heuristic(message: str) -> Intent:
     # Nothing distinctive matched → force a clarification.
     return Intent(label="clarify", confidence=0.30,
                   rationale="no distinctive intent signal")
+
+
+_ML_ARTIFACT_PATH = Path(__file__).resolve().parent / "models" / "intent_classifier.joblib"
+_ml_state: Optional[dict[str, Any]] = None
+_ml_load_failed = False
+
+
+def _load_ml_classifier() -> Optional[dict[str, Any]]:
+    """Load the trained embedder + classifier once, lazily, and cache it.
+
+    Returns None (permanently, for this process) if the artifact or its
+    dependencies aren't available — callers fall back to the heuristic.
+    """
+    global _ml_state, _ml_load_failed
+    if _ml_state is not None or _ml_load_failed:
+        return _ml_state
+    try:
+        import joblib
+        from sentence_transformers import SentenceTransformer
+
+        artifact = joblib.load(_ML_ARTIFACT_PATH)
+        artifact["embedder"] = SentenceTransformer(artifact["model_name"])
+        _ml_state = artifact
+        return _ml_state
+    except Exception:
+        _ml_load_failed = True
+        return None
+
+
+def _ml_classify(message: str) -> Intent:
+    """Embed the message, classify with the trained Logistic Regression.
+
+    Confidence is the model's real predict_proba for the top class. Rationale
+    is the nearest training example by cosine similarity — a linear model on
+    dense embeddings has no keyword-level "why" the way the heuristic did, so
+    this substitutes a concrete, inspectable stand-in.
+    """
+    import numpy as np
+
+    state = _load_ml_classifier()
+    embedding = state["embedder"].encode([message])[0]
+    clf = state["classifier"]
+    proba = clf.predict_proba([embedding])[0]
+    classes = clf.classes_
+    top_idx = int(np.argmax(proba))
+    label = str(classes[top_idx])
+    confidence = float(proba[top_idx])
+
+    train_emb = state["train_embeddings"]
+    sims = (train_emb @ embedding) / (
+        np.linalg.norm(train_emb, axis=1) * np.linalg.norm(embedding) + 1e-9
+    )
+    nearest = state["train_texts"][int(np.argmax(sims))]
+    rationale = f"closest to training example: '{nearest}'"
+
+    return Intent(label=label, confidence=confidence, rationale=rationale)
+
+
+def _offline_classify(message: str) -> Intent:
+    """ML classifier if available, else the keyword heuristic."""
+    if _load_ml_classifier() is not None:
+        try:
+            return _ml_classify(message)
+        except Exception:
+            pass
+    return _heuristic(message)
 
 
 def classify(message: str) -> Intent:
@@ -108,9 +181,9 @@ def classify(message: str) -> Intent:
                 label, confidence = "clarify", min(confidence, 0.4)
             intent = Intent(label=label, confidence=confidence, rationale=rationale)
         except (LLMUnavailable, ValueError, KeyError):
-            intent = _heuristic(message)
+            intent = _offline_classify(message)
     else:
-        intent = _heuristic(message)
+        intent = _offline_classify(message)
 
     # Enforce the threshold uniformly, whatever produced the intent.
     if intent.label != "hardship" and intent.confidence < config.CONFIDENCE_THRESHOLD:

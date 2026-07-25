@@ -31,13 +31,34 @@ uvicorn api.main:app --reload   # serve the API (OpenAPI docs at /docs)
 
 `LLM_PROVIDER` (env) selects the model backend:
 
-- `offline` (default) — deterministic heuristic classifier + canned prose. The
-  whole graph runs with **no API key**, so demo prep and CI are reproducible.
+- `offline` (default) — a trained ML intent classifier (see below) + canned
+  prose. No LLM API key needed, so demo prep and CI are reproducible.
 - `anthropic` — set `ANTHROPIC_API_KEY` (+ optional `LLM_MODEL`).
 - `openai` — set `OPENAI_API_KEY`.
 
 `agent/llm.py` is the *only* file that talks to a model; swapping providers
 touches nothing else.
+
+## Intent classifier
+
+`agent/classifier.py` tries three layers in order: LLM (if configured) →
+trained ML classifier → keyword heuristic (last-resort fallback).
+
+The ML classifier is local sentence-transformer embeddings
+(`all-MiniLM-L6-v2`, 384-dim, CPU-only) feeding a Logistic Regression trained
+on `agent/training_data.py`. **First run needs internet once** to download the
+~80MB embedding model (cached afterward in `~/.cache/huggingface` — no network
+needed on subsequent runs, and no LLM API key ever needed for this path).
+
+```bash
+python scripts/train_classifier.py    # re-run after editing training_data.py
+```
+
+Saves `agent/models/intent_classifier.joblib` (committed to git — teammates
+don't need to retrain to run the app, only to change the training data).
+`tests/test_classifier.py` measures real held-out accuracy: its ~40 utterances
+are deliberately disjoint from the training set, so the reported
+precision/recall/F1 is genuine generalisation, not memorisation.
 
 ## The three endpoints
 
@@ -72,3 +93,9 @@ replayable, and every write is idempotency-keyed on `session_id:tool`.
   the model.
 - **The ledger is append-only and hash-chained.** Tamper with a row →
   `/audit/verify` names the exact broken record.
+- **Writes are atomic and the chain is concurrency-safe.** Each write action
+  (mutation + ledger row + idempotency record) runs in a single
+  `BEGIN IMMEDIATE` transaction (`backend/database.py:write_transaction`), so a
+  crash can't leave a mutation without its audit row, and concurrent appends
+  can't fork the chain. Proven by `tests/test_ledger.py` — 8 threads × 15
+  appends verify clean; the same load forks an unserialised chain.

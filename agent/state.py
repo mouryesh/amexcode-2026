@@ -49,15 +49,24 @@ class AgentState(TypedDict, total=False):
 
 
 def new_state(session_id: str, member_id: str, message: str,
-              confirm: bool = False, reauthenticated: bool = False) -> AgentState:
-    """Build a fresh state for one member message."""
+              confirm: bool = False, reauthenticated: bool = False,
+              history: list[dict[str, str]] | None = None) -> AgentState:
+    """Build a fresh state for one member message.
+
+    `history` is the session's prior turns (from backend.sessions.get_history),
+    threaded in ahead of the current message so nodes that read state["messages"]
+    — sentiment detection, the escalation transcript — see the whole
+    conversation, not just this turn.
+    """
+    messages = list(history) if history else []
+    messages.append({"role": "member", "text": message})
     return AgentState(
         session_id=session_id,
         member_id=member_id,
         intent=None,
         confidence=0.0,
         slots={},
-        messages=[{"role": "member", "text": message}],
+        messages=messages,
         confirm=confirm,
         reauthenticated=reauthenticated,
         account_facts={},

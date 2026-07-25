@@ -1,0 +1,158 @@
+OPEN QUESTIONS — things to come back to
+=========================================
+Running list of design gaps identified during build, not yet decided/implemented.
+Add to this file as new ones come up; move resolved items to a "RESOLVED" section
+with the decision once we act on them.
+
+
+RESOLVED
+========
+
+1. PERSISTENT / REPEATED REQUEST HANDLING
+------------------------------------------
+Status: RESOLVED — implemented 2026-07-24
+
+Decision made:
+  a) New table backend/database.py:session_messages (session_id, member_id,
+     role, text, intent_label, decision_outcome, decision_reason_code,
+     policy_id, timestamp). New file backend/sessions.py owns it:
+       - record_turn(...)         append one turn
+       - get_history(session_id)  prior turns as [{role, text}, ...]
+       - count_prior_declines(session_id, policy_id, reason_code)
+  b) agent/state.py:new_state() takes an optional `history` param and
+     prepends it to state["messages"], so sentiment detection and the
+     escalation transcript now see the WHOLE conversation, not just the
+     current turn.
+  c) api/routes.py:agent_message() loads history via sessions.get_history()
+     before building state, and calls sessions.record_turn() for both the
+     member's message and the agent's reply after run() completes.
+  d) agent/nodes.py:run_policy() — AFTER calling the pure policy_engine.evaluate()
+     — checks sessions.count_prior_declines() for the same (policy_id,
+     reason_code) in this session. If the count is >= threshold, the Decision
+     is overridden (Decision.model_copy) to outcome=ESCALATE,
+     reason_code="REPEATED_DECLINE_ESCALATED", rule_id="repeat_decline_escalation",
+     while KEEPING policy_id/policy_version/inputs_used for audit traceability.
+     policy_engine.py itself stays a pure function — no DB access there; the
+     override lives in the orchestration layer (nodes.py), not the decision
+     core. No graph.py changes needed — route_after_policy already routes any
+     ESCALATE outcome to build_escalation.
+
+Answers to the "decide later" questions:
+  - Session history lives in a new DB table (session_messages), not the
+    client and not reused from audit_ledger — audit_ledger is the tamper-proof
+    decision trail, conversation text doesn't belong mixed into it.
+  - Threshold: shared/config.py DECLINE_REPEAT_ESCALATE_THRESHOLD, default 1
+    (1 prior identical decline in the session triggers escalation on the next
+    ask). Env-overridable. First ask still declines normally — matches the
+    Rahul persona demo unchanged.
+  - Scope: DECLINE only, for now. QUEUE was deliberately left alone — a queued
+    request is already pending human review, so "asked again while queued"
+    is a different situation, not "stuck being told no."
+
+Verified:
+  - tests/test_sessions.py — record/get_history round-trip, count_prior_declines
+    scoping (by session, by policy_id, by reason_code).
+  - tests/test_api.py::test_repeated_decline_escalates — through the real
+    /agent/message endpoint: ask #1 = normal DECLINE, ask #2 (identical) =
+    ESCALATE with reason REPEATED_DECLINE_ESCALATED, escalation_packet.transcript
+    has all 3 prior turns.
+  - tests/test_api.py::test_unrelated_requests_dont_count_toward_repeat_threshold
+    — an unrelated request in the same session doesn't trip the counter.
+  - tests/test_api.py::test_priya_single_ask_still_approves_normally — sanity
+    check the override doesn't touch APPROVE/QUEUE paths.
+  - demo.py re-run: all four personas unaffected (each uses a fresh session,
+    asks once).
+  - Full suite: 69/69 passing.
+
+
+OPEN
+====
+
+2. FULL PER-MEMBER HISTORY / ANALYSIS STORE
+---------------------------------------------
+Status: OPEN — flagged 2026-07-24, to revisit
+
+Question:
+  Beyond a single session's conversation, do we want a durable, queryable
+  store of everything that happened for a given member — every session, every
+  decision, every escalation — so we can do full analysis per user later
+  (patterns across sessions, not just within one)?
+
+Notes:
+  - This is broader than item #1 above. #1 (now resolved) covers within-one-
+    session memory (needed to even detect repeated asking), stored per-session
+    in backend/sessions.py:session_messages. This item is about cross-session,
+    long-term per-member history for analysis/reporting — session_messages now
+    exists and already carries member_id on every row, so the raw data to
+    aggregate across sessions is there; this item is about deciding whether/how
+    to query and present that, not about a new storage mechanism.
+  - The audit_ledger table also has session_id + member_id on every decision
+    record — the two tables together (session_messages for conversation,
+    audit_ledger for the tamper-proof decision/action trail) are probably the
+    full raw material for this; still worth deciding deliberately.
+
+
+3. REPEAT-THRESHOLD SCOPE FOR QUEUE OUTCOMES
+-----------------------------------------------
+Status: OPEN — deferred while resolving #1, 2026-07-24
+
+Question:
+  Item #1's repeat-escalation logic (agent/nodes.py:run_policy) only fires on
+  repeated DECLINE. Should a repeated QUEUE outcome (e.g. Ananya asking again
+  while her underwriting case is still pending) also do something automated —
+  e.g. tell her a case is already open instead of opening a duplicate one, or
+  escalate if she asks enough times? Deliberately left alone for now since
+  "already pending human review" felt different from "stuck being told no,"
+  but not a settled decision.
+
+
+4. AMBIGUOUS SLOT RESOLUTION (MULTIPLE CANDIDATES)
+-----------------------------------------------------
+Status: OPEN — identified 2026-07-24
+
+Question:
+  When check_slots auto-resolves a slot from account data and finds MORE THAN
+  ONE plausible candidate (e.g. a member has two unreversed late fees, or in
+  general "two loans active" — which one is the request about?), what should
+  happen?
+
+What happens today:
+  agent/nodes.py:check_slots, fee_waiver branch:
+    fee_txn = next(
+        (t for t in accounts.get_transactions(member_id, limit=20)
+         if t["kind"] == "fee" and not t["reversed"]),
+        None,
+    )
+  next() on a generator returns the FIRST match and stops — it never checks
+  for a second one. get_transactions orders by date DESC, so with two
+  unreversed fees this SILENTLY picks the most recent one and waives that,
+  without ever telling the member there was a choice or asking which one they
+  meant. Same shape of risk applies anywhere else slot auto-resolution assumes
+  "exactly one match" (e.g. card_id, if the schema ever grows to support
+  multiple active cards per member).
+
+Why this matters:
+  It breaks a principle the rest of the system follows: the classifier never
+  guesses below its confidence threshold — it asks a clarifying question
+  instead. check_slots currently does the opposite here: it guesses silently
+  instead of asking.
+
+Decision on the approach (agreed 2026-07-24):
+  Don't pick — ask. If auto-resolution finds multiple candidates, treat the
+  slot as needing disambiguation rather than filling it: surface the options
+  to the member explicitly and ask which one they mean, e.g. "You have two
+  unpaid late fees: Rs 500 from Jul 3 and Rs 30 from Jul 18 — which one would
+  you like waived?" Do not default to "most recent" or any other silent
+  tie-break.
+
+Still to design when this gets built:
+  - Where the candidate list lives in AgentState while awaiting the member's
+    answer (new field, e.g. ambiguous_slots: {field_name: [candidates]}),
+    and how route_after_slots / call_llm distinguish "missing, ask for it"
+    from "ambiguous, ask which one."
+  - How the member's disambiguating reply on the NEXT turn gets matched back
+    to a specific candidate (e.g. they say "the July 3 one" or "the Rs 500
+    one," or a numbered list is presented so they can just reply "1") — this
+    is new parsing logic, not a plain missing-slot fill.
+  - Whether to reuse this same mechanism for card_id and any other slot that
+    could someday have more than one live candidate per member.

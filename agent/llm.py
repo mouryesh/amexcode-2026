@@ -48,6 +48,12 @@ class LLMClient:
             import openai
 
             self._client = openai.OpenAI(api_key=config.OPENAI_API_KEY)
+        elif self.provider == "groq":
+            import openai  # Groq exposes an OpenAI-compatible chat completions API
+
+            self._client = openai.OpenAI(
+                api_key=config.GROQ_API_KEY, base_url=config.GROQ_BASE_URL
+            )
 
     # ------------------------------------------------------------------ #
     def _call_raw(self, system: str, user: str, max_tokens: Optional[int] = None) -> str:
@@ -67,7 +73,7 @@ class LLMClient:
                         messages=[{"role": "user", "content": user}],
                     )
                     return resp.content[0].text
-                else:  # openai
+                else:  # openai or groq — both use the OpenAI-compatible chat completions shape
                     resp = self._client.chat.completions.create(
                         model=self.model,
                         max_tokens=max_tokens,
