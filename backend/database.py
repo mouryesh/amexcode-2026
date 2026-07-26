@@ -1,168 +1,234 @@
-"""backend/database.py — SQLite engine, connections, and table DDL.
+"""backend/database.py — PostgreSQL engine, pooling, DDL, transactions.
 
-Owned by Person B. The append-only constraint on `audit_ledger` is enforced
-here at the access layer: no function anywhere constructs an UPDATE or DELETE
-against it. There is deliberately no such code path in this file.
+Replaces the SQLite engine. The public surface is deliberately unchanged
+(`db_session`, `write_transaction`, `init_db`, `tables_empty`) so the agent
+layer needed no edits — only the SQL placeholder style moved from `?` to `%s`.
 
-Imports: shared.config only.
+Two guarantees this file exists to provide:
+
+1. **Serialised chain appends.** `write_transaction()` takes a Postgres
+   *transaction-scoped advisory lock* before anything else runs. That is the
+   direct translation of SQLite's `BEGIN IMMEDIATE`: the write lock is held from
+   the top of the transaction, so the ledger's read-latest-hash-then-insert can
+   never interleave with another writer and the chain cannot fork. The lock is
+   released automatically at COMMIT or ROLLBACK — there is no unlock path to
+   forget.
+
+2. **Post-commit Splunk shipping.** Audit rows are queued during the transaction
+   and only handed to Splunk *after* the commit succeeds. A rolled-back
+   transaction ships nothing, so Splunk can never show an event the database
+   does not have.
+
+Throughput note: the advisory lock serialises every write action, not just the
+ledger insert, because they share one transaction. That is the correct trade for
+an audit chain — correctness over concurrency — but it does cap write throughput
+at one action at a time. Sharding the chain by member would lift that, at the
+cost of one chain head per shard to anchor.
+
+Imports: shared.config, shared.splunk.
 """
 from __future__ import annotations
 
-import sqlite3
 from contextlib import contextmanager
-from typing import Iterator
+from contextvars import ContextVar
+from typing import Any, Iterator, Optional
 
+from psycopg.rows import dict_row
+from psycopg_pool import ConnectionPool
+
+from shared import splunk
 from shared.config import config
+
+# Audit events accumulated during the current write transaction, shipped to
+# Splunk only once that transaction commits.
+_pending_audit: ContextVar[Optional[list[dict[str, Any]]]] = ContextVar(
+    "_pending_audit", default=None
+)
+
+_pool: Optional[ConnectionPool] = None
+
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS accounts (
-    member_id             TEXT PRIMARY KEY,
-    name                  TEXT NOT NULL,
-    tenure_months         INTEGER NOT NULL,
-    balance               REAL NOT NULL,
-    credit_limit          REAL NOT NULL,
-    late_payments_12m     INTEGER NOT NULL DEFAULT 0,
+    member_id               TEXT PRIMARY KEY,
+    name                    TEXT NOT NULL,
+    tenure_months           INTEGER NOT NULL,
+    balance                 NUMERIC(14,2) NOT NULL,
+    credit_limit            NUMERIC(14,2) NOT NULL,
+    late_payments_12m       INTEGER NOT NULL DEFAULT 0,
     income_staleness_months INTEGER NOT NULL DEFAULT 0,
-    utilisation           REAL NOT NULL DEFAULT 0.0,
-    card_id               TEXT,
-    card_status           TEXT NOT NULL DEFAULT 'active',
-    fraud_hold            INTEGER NOT NULL DEFAULT 0,
-    vulnerability_flag    INTEGER NOT NULL DEFAULT 0,
-    email                 TEXT,
-    phone                 TEXT
+    utilisation             REAL    NOT NULL DEFAULT 0,
+    card_id                 TEXT,
+    card_status             TEXT    NOT NULL DEFAULT 'active',
+    fraud_hold              BOOLEAN NOT NULL DEFAULT FALSE,
+    vulnerability_flag      BOOLEAN NOT NULL DEFAULT FALSE,
+    -- Compound key for policy dispatch: the same intent resolves to a
+    -- different policy on a charge card, or in another market.
+    market                  TEXT    NOT NULL DEFAULT 'IN',
+    product_family          TEXT    NOT NULL DEFAULT 'personal_credit',
+    email                   TEXT,
+    phone                   TEXT
 );
 
 CREATE TABLE IF NOT EXISTS transactions (
     txn_ref     TEXT PRIMARY KEY,
-    member_id   TEXT NOT NULL,
+    member_id   TEXT NOT NULL REFERENCES accounts(member_id),
     date        TEXT NOT NULL,
-    amount      REAL NOT NULL,
+    amount      NUMERIC(14,2) NOT NULL,
     description TEXT NOT NULL,
     kind        TEXT NOT NULL DEFAULT 'charge',
-    reversed    INTEGER NOT NULL DEFAULT 0,
-    FOREIGN KEY (member_id) REFERENCES accounts(member_id)
+    reversed    BOOLEAN NOT NULL DEFAULT FALSE
 );
+CREATE INDEX IF NOT EXISTS idx_txn_member ON transactions (member_id, date DESC);
 
 CREATE TABLE IF NOT EXISTS waiver_history (
-    id             INTEGER PRIMARY KEY AUTOINCREMENT,
-    member_id      TEXT NOT NULL,
+    id             BIGSERIAL PRIMARY KEY,
+    member_id      TEXT NOT NULL REFERENCES accounts(member_id),
     date           TEXT NOT NULL,
-    fee_amount     REAL NOT NULL,
-    policy_version TEXT NOT NULL,
-    FOREIGN KEY (member_id) REFERENCES accounts(member_id)
+    fee_amount     NUMERIC(14,2) NOT NULL,
+    policy_version TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS idx_waiver_member ON waiver_history (member_id, date DESC);
 
--- Append-only, hash-chained. No UPDATE or DELETE path exists for this table.
+-- Append-only, hash-chained.
+--
+-- `inputs` and `decision` are stored as canonical JSON TEXT, not JSONB, because
+-- the hash is computed over that exact string. JSONB normalises key order and
+-- numeric representation, which would silently break hash reproducibility on
+-- read-back. The generated JSONB columns alongside give indexing and search
+-- without touching the bytes that were hashed.
 CREATE TABLE IF NOT EXISTS audit_ledger (
-    record_id   INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_id  TEXT,
-    timestamp   TEXT NOT NULL,
-    actor       TEXT NOT NULL,
-    action      TEXT NOT NULL,
-    inputs      TEXT NOT NULL,
-    decision    TEXT,
-    prev_hash   TEXT NOT NULL,
-    record_hash TEXT NOT NULL
+    record_id    BIGSERIAL PRIMARY KEY,
+    trace_id     TEXT,
+    session_id   TEXT,
+    member_ref   TEXT,
+    event_type   TEXT NOT NULL,          -- turn | policy | tool | security | terminal
+    actor        TEXT NOT NULL,          -- member | agent | system | human_agent
+    action       TEXT NOT NULL,
+    occurred_at  TEXT NOT NULL,          -- ISO-8601 UTC; the exact string that was hashed
+    inputs       TEXT NOT NULL,          -- canonical JSON
+    decision     TEXT,                   -- canonical JSON, policy events only
+    prev_hash    CHAR(64) NOT NULL,
+    record_hash  CHAR(64) NOT NULL,
+    inputs_j     JSONB GENERATED ALWAYS AS (inputs::jsonb) STORED,
+    decision_j   JSONB GENERATED ALWAYS AS (
+                     CASE WHEN decision IS NULL THEN NULL ELSE decision::jsonb END
+                 ) STORED
 );
+CREATE INDEX IF NOT EXISTS idx_ledger_session ON audit_ledger (session_id, record_id);
+CREATE INDEX IF NOT EXISTS idx_ledger_member  ON audit_ledger (member_ref, occurred_at);
+CREATE INDEX IF NOT EXISTS idx_ledger_event   ON audit_ledger (event_type, occurred_at);
+CREATE INDEX IF NOT EXISTS idx_ledger_dec     ON audit_ledger USING GIN (decision_j);
+
+-- Enforcement, not decoration: this blocks UPDATE and DELETE for everyone,
+-- including the table owner. A superuser can still drop the trigger — which is
+-- exactly why the chain head is also anchored outside the database. Having to
+-- disable this trigger to run the tamper demo IS the demonstration.
+CREATE OR REPLACE FUNCTION audit_ledger_immutable() RETURNS trigger AS $fn$
+BEGIN
+    RAISE EXCEPTION 'audit_ledger is append-only: % denied on record_id %',
+        TG_OP, OLD.record_id;
+END;
+$fn$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_audit_ledger_immutable ON audit_ledger;
+CREATE TRIGGER trg_audit_ledger_immutable
+    BEFORE UPDATE OR DELETE ON audit_ledger
+    FOR EACH ROW EXECUTE FUNCTION audit_ledger_immutable();
 
 CREATE TABLE IF NOT EXISTS idempotency_keys (
     key         TEXT PRIMARY KEY,
+    action      TEXT NOT NULL,
     inputs_hash TEXT NOT NULL,
     result      TEXT NOT NULL,
     created_at  TEXT NOT NULL
 );
 
--- Turn-by-turn transcript, per session. Kept separate from audit_ledger so the
--- ledger stays "one row = one decision". Lets the agent thread prior turns into
--- a fresh AgentState (real transcript, real cross-turn sentiment) and detect
--- repeated-request patterns (e.g. the same decline asked again).
---
--- RECONCILED SCHEMA (see BACKEND_RECONCILIATION.md): a superset of the two
--- parallel conversation tables that existed on the mouryesh and Yash_Amex
--- branches. Adopts the Yash_Amex column names (turn_index, role, content,
--- intent, confidence, created_at) so both people's code writes the same shape,
--- and keeps the decision-tracking columns the repeat-decline escalation needs
--- (decision_outcome, decision_reason_code, policy_id).
-CREATE TABLE IF NOT EXISTS messages (
-    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_id           TEXT    NOT NULL,
-    member_id            TEXT,
-    turn_index           INTEGER NOT NULL,
-    role                 TEXT    NOT NULL,   -- 'member' | 'agent' | 'system'
-    content              TEXT    NOT NULL,
-    intent               TEXT,
-    confidence           REAL,
-    decision_outcome     TEXT,
-    decision_reason_code TEXT,
-    policy_id            TEXT,
-    created_at           TEXT    NOT NULL
+-- Chain-head anchor. One row per anchoring event, written at session close.
+-- In production this is mirrored to S3 Object Lock; locally it is just proof
+-- the head was observed at a point in time.
+CREATE TABLE IF NOT EXISTS chain_anchors (
+    id          BIGSERIAL PRIMARY KEY,
+    record_id   BIGINT NOT NULL,
+    chain_head  CHAR(64) NOT NULL,
+    session_id  TEXT,
+    anchored_at TEXT NOT NULL
 );
-
-CREATE INDEX IF NOT EXISTS idx_messages_session ON messages (session_id, turn_index);
 """
 
 
-def get_connection() -> sqlite3.Connection:
-    """Open a connection with row access by column name and FKs enforced."""
-    conn = sqlite3.connect(config.DB_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    # WAL lets readers run concurrently with the single writer; busy_timeout
-    # makes a second writer WAIT for the lock (up to 5s) instead of immediately
-    # raising "database is locked". Together with write_transaction()'s
-    # BEGIN IMMEDIATE, this serialises writes cleanly under concurrency.
-    conn.execute("PRAGMA busy_timeout = 5000")
-    conn.execute("PRAGMA journal_mode = WAL")
-    return conn
+def _get_pool() -> ConnectionPool:
+    """Lazily open the pool so importing this module never needs a live server."""
+    global _pool
+    if _pool is None:
+        _pool = ConnectionPool(
+            conninfo=config.PG_DSN,
+            min_size=config.PG_POOL_MIN,
+            max_size=config.PG_POOL_MAX,
+            kwargs={"row_factory": dict_row, "autocommit": False},
+            open=True,
+        )
+    return _pool
+
+
+def close_pool() -> None:
+    """Shut the pool down. Call on application shutdown and between test runs."""
+    global _pool
+    if _pool is not None:
+        _pool.close()
+        _pool = None
 
 
 @contextmanager
-def db_session() -> Iterator[sqlite3.Connection]:
-    """Transactional connection context manager: commit on success, rollback on error.
+def db_session() -> Iterator[Any]:
+    """Read (or standalone-write) connection. Commits on success, rolls back on error.
 
-    Used for reads and standalone writes. For the atomic action path (mutate +
-    ledger append + idempotency, all-or-nothing, serialised) use
-    write_transaction() instead.
+    For anything that appends to the ledger, use `write_transaction()` instead —
+    this one does not hold the chain lock.
     """
-    conn = get_connection()
-    try:
+    with _get_pool().connection() as conn:
         yield conn
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
 
 
 @contextmanager
-def write_transaction() -> Iterator[sqlite3.Connection]:
-    """A single serialised, all-or-nothing write transaction.
+def write_transaction() -> Iterator[Any]:
+    """One serialised, all-or-nothing write transaction.
 
-    Issues BEGIN IMMEDIATE, which acquires the write lock UP FRONT — before any
-    read in the transaction body. This is what makes the ledger's
-    read-latest-hash-then-insert safe under concurrency: no other writer can
-    slip an append in between, so the hash chain can never fork. Everything in
-    the body commits together or rolls back together, so an account mutation,
-    its ledger row, and its idempotency record are never left partially written.
+    Takes the chain advisory lock up front, so a mutation, its ledger row and
+    its idempotency record commit together and no other writer can slip an
+    append in between. Audit events queued during the body are shipped to Splunk
+    only after the commit lands.
     """
-    conn = get_connection()
-    conn.isolation_level = None  # take manual control of BEGIN/COMMIT/ROLLBACK
+    token = _pending_audit.set([])
     try:
-        conn.execute("BEGIN IMMEDIATE")
-        yield conn
-        conn.execute("COMMIT")
-    except Exception:
-        conn.execute("ROLLBACK")
-        raise
+        with _get_pool().connection() as conn:
+            conn.execute("SELECT pg_advisory_xact_lock(%s)", (config.LEDGER_LOCK_KEY,))
+            yield conn
+        # Reaching here means the pool's context manager committed cleanly.
+        events = _pending_audit.get() or []
+        if events:
+            splunk.ship_many(events)
     finally:
-        conn.close()
+        _pending_audit.reset(token)
+
+
+def queue_audit_event(event: dict[str, Any]) -> None:
+    """Hold an audit event for post-commit shipping.
+
+    Called by the ledger during a write transaction. Outside a transaction there
+    is nothing to wait for, so the event ships immediately.
+    """
+    pending = _pending_audit.get()
+    if pending is None:
+        splunk.ship_many([event])
+    else:
+        pending.append(event)
 
 
 def init_db() -> None:
-    """Create tables if they do not exist. Safe to call repeatedly."""
-    with db_session() as conn:
-        conn.executescript(_SCHEMA)
+    """Create tables, indexes and the immutability trigger. Safe to re-run."""
+    with _get_pool().connection() as conn:
+        conn.execute(_SCHEMA)
 
 
 def tables_empty() -> bool:
@@ -170,3 +236,13 @@ def tables_empty() -> bool:
     with db_session() as conn:
         row = conn.execute("SELECT COUNT(*) AS n FROM accounts").fetchone()
         return row["n"] == 0
+
+
+def ping() -> bool:
+    """True when Postgres answers. Used by the health endpoint and init script."""
+    try:
+        with db_session() as conn:
+            conn.execute("SELECT 1")
+        return True
+    except Exception:
+        return False

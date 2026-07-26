@@ -1,0 +1,18 @@
+# --- core ---------------------------------------------------------------- #
+pydantic>=2.6
+fastapi>=0.110
+uvicorn[standard]>=0.29
+PyYAML>=6.0
+python-dotenv>=1.0
+
+# --- stores -------------------------------------------------------------- #
+psycopg[binary,pool]>=3.1      # PostgreSQL: system of record + hash chain
+pymongo>=4.6                   # MongoDB: live flow state documents
+requests>=2.31                 # Splunk HEC (plain HTTP, no SDK needed)
+
+# --- LLM (optional; offline mode needs none of these) -------------------- #
+anthropic>=0.25 ; extra == "llm"
+openai>=1.20 ; extra == "llm"
+
+# --- test ---------------------------------------------------------------- #
+pytest>=8.0

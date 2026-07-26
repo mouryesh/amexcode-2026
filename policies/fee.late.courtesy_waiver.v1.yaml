@@ -1,0 +1,131 @@
+# fee.late.courtesy_waiver.v1 — late / returned-payment fee courtesy reversal.
+#
+# Mirrors POLICIES.md §3 (POL-FEE-001..006). Read by agent/policy_engine.py:
+# rules evaluate top-to-bottom, FIRST full match wins, else `default`.
+#
+# Outcome mapping (doc -> engine): approve->APPROVE, deny->DECLINE,
+# escalate->ESCALATE, needs_input->QUEUE.
+#
+# Source tags:  amex_firsthand | industry_standard | regulatory
+#
+# FACTS USED. The first block uses facts backend/accounts.get_account_facts()
+# already provides. Rules tagged `requires_fact:` need that fact added to
+# get_account_facts() + seed before they can fire (personas match earlier rules,
+# so the demo is unaffected until then).
+
+policy_id: fee.late.courtesy_waiver
+version: v1
+description: Courtesy reversal/waiver of a late or returned-payment fee.
+
+default:
+  outcome: QUEUE
+  reason_code: MANUAL_REVIEW
+  reason_text: >-
+    This request needs a quick manual review before it can be completed.
+
+rules:
+  # --- Tier 0/1: duty of care + standing (existing facts) ------------------ #
+  - id: hardship_detected
+    policy_ref: POL-FEE-001
+    tier: 0
+    source: amex_firsthand
+    when:
+      - { field: distress_signals, op: eq, value: true }
+    outcome: ESCALATE
+    reason_code: HARDSHIP_SIGNAL
+    reason_text: >-
+      We noticed you may be going through a difficult time. Rather than process
+      this automatically, we are connecting you with a specialist who can help.
+    rationale: Hardship is a duty-of-care matter, not a fee-waiver-counter decision.
+
+  - id: below_minimum_tenure
+    policy_ref: POL-FEE-001
+    tier: 1
+    source: industry_standard
+    when:
+      - { field: tenure_months, op: lt, value: 6 }
+    outcome: DECLINE
+    reason_code: MIN_TENURE_NOT_MET
+    reason_text: >-
+      A courtesy waiver requires at least 6 months of account history. Your
+      account is newer than that, so this fee can't be waived automatically yet.
+    rationale: Minimum tenure guards goodwill waivers against fresh-account abuse.
+
+  - id: repeat_waiver
+    policy_ref: POL-FEE-005
+    tier: 2
+    source: industry_standard
+    source_ref: "~1 courtesy waiver per rolling 12 months (industry default)"
+    when:
+      - { field: prior_waivers_8m, op: gte, value: 2 }
+    outcome: DECLINE
+    reason_code: WAIVER_FREQUENCY_EXCEEDED
+    reason_text: >-
+      Our records show two courtesy waivers on this account in the last eight
+      months. We're unable to waive another right now, but you can appeal this
+      decision and a specialist will review your circumstances.
+    rationale: Courtesy is finite; repeated waivers indicate a servicing pattern.
+
+  - id: clean_payer_approve
+    policy_ref: POL-FEE-001
+    tier: 1
+    source: amex_firsthand
+    when:
+      - { field: tenure_months, op: gte, value: 6 }
+      - { field: prior_waivers_8m, op: lt, value: 2 }
+      - { field: late_payments_12m, op: lte, value: 1 }
+    outcome: APPROVE
+    reason_code: GOODWILL_WAIVER_GRANTED
+    reason_text: >-
+      Thanks for being a valued cardmember. As a one-time courtesy we've
+      reversed this late fee and your statement has been recalculated.
+    rationale: Long-tenured, low-delinquency members qualify for a goodwill waiver.
+
+# planned_rules: doc rules that need a new fact. NOT evaluated by the engine
+# (it reads only `rules:` above). Move an entry up into `rules:` once
+# get_account_facts() + seed supply the field named in `requires_fact:`.
+planned_rules:
+  - id: account_delinquent
+    policy_ref: POL-FEE-001
+    tier: 1
+    source: amex_firsthand
+    source_ref: "2 consecutive missed minimums = delinquent (Cardmember Agreement)"
+    requires_fact: consecutive_missed_periods
+    when:
+      - { field: consecutive_missed_periods, op: gte, value: 2 }
+    outcome: ESCALATE
+    reason_code: ACCOUNT_DELINQUENT
+    reason_text: >-
+      Account minimum unpaid for 2 consecutive billing periods. This routes to
+      the hardship/collections team rather than an automated reversal.
+    rationale: Delinquent accounts are out of good standing; not auto-resolvable.
+
+  - id: fee_above_statutory_cap
+    policy_ref: POL-FEE-004
+    tier: 2
+    source: regulatory
+    source_ref: "CARD Act / Reg Z 12 CFR 1026.52(b): fee <= amount/min due"
+    requires_fact: assessed_fee_amount
+    when:
+      - { field: assessed_fee_amount, op: gt, value: 40 }
+    outcome: ESCALATE
+    reason_code: FEE_EXCEEDS_CAP
+    reason_text: >-
+      The fee on file is above the CARD Act safe-harbor amount and may itself be
+      an error; routing for correction.
+    rationale: A fee above the $29/$40 tiers breaches the reasonable-and-proportional cap.
+
+  - id: above_auto_approval_amount
+    policy_ref: POL-FEE-006
+    tier: 2
+    source: industry_standard
+    source_ref: "auto-approve reversals <= $50 (default cap)"
+    requires_fact: reversal_amount
+    when:
+      - { field: reversal_amount, op: gt, value: 50 }
+    outcome: ESCALATE
+    reason_code: AMOUNT_ABOVE_THRESHOLD
+    reason_text: >-
+      This reversal is above the amount we can clear automatically, so a
+      supervisor will review it.
+    rationale: Caps runaway or stacked-fee requests from auto-clearing.

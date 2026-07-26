@@ -2,6 +2,11 @@
 __pycache__/
 *.pyc
 
+# Secrets — never commit. .env.example is the tracked template.
+.env
+.env.*
+!.env.example
+
 # SQLite databases (generated at runtime / self-checks)
 *.db
 _*_selfcheck.db

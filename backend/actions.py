@@ -1,18 +1,23 @@
 """backend/actions.py — write-side of the fake core banking system.
 
-Owned by Person B. Every function performs one ATOMIC, SERIALISED unit of work
-inside a single write_transaction():
-  1. Check the idempotency key — if already processed with the same inputs,
-     return the original result. Same key + different inputs → IdempotencyConflict.
-  2. Mutate the relevant table(s).
-  3. Append the hash-chained ledger row (via ledger.append_on_conn, same txn).
-  4. Record the idempotency key.
-All four steps commit together or roll back together. Because the transaction
-holds the write lock from the start (BEGIN IMMEDIATE), the ledger's
-read-latest-hash-then-insert can never interleave with another action, so the
-chain cannot fork under concurrency.
+Every function is one ATOMIC, SERIALISED unit of work inside a single
+write_transaction():
 
-This is the SOLE ledger writer in the codebase. No other file appends.
+  1. Check the idempotency key — same key + same inputs returns the original
+     result; same key + different inputs is a conflict.
+  2. Mutate.
+  3. Append the hash-chained ledger row on the same transaction.
+  4. Read the effect back.
+  5. Record the idempotency key.
+
+All of it commits together or rolls back together, and the transaction holds the
+chain advisory lock from the top, so the ledger's read-latest-hash-then-insert
+can never interleave and the chain cannot fork.
+
+Effect verification is a read-back on the same transaction, which against a
+local Postgres is close to tautological — it earns its keep when this points at
+a real core, where a timeout means indeterminate rather than failed. Keeping the
+branch here now means the caller already handles the third outcome.
 
 Imports: backend.database, backend.ledger, shared.schemas, shared.exceptions.
 """
@@ -26,7 +31,7 @@ from typing import Any, Callable, Optional
 
 from backend import ledger
 from backend.database import write_transaction
-from shared.exceptions import IdempotencyConflict
+from shared.exceptions import EffectUnverified, IdempotencyConflict
 from shared.schemas import Receipt
 
 
@@ -47,19 +52,13 @@ def _execute(
     decision: Optional[dict[str, Any]],
     session_id: Optional[str],
     work: Callable[[Any], Receipt],
+    verify: Optional[Callable[[Any], bool]] = None,
 ) -> Receipt:
-    """Run one write action atomically and exactly once.
-
-    `work(conn)` performs the table mutation on the shared transaction and
-    returns the Receipt. The idempotency check, the ledger append, and the
-    idempotency record all happen on the SAME connection/transaction, so a
-    crash can never leave a mutation without its ledger row (or a completed
-    action without its idempotency guard).
-    """
+    """Run one write action atomically and exactly once."""
     ih = _inputs_hash(inputs)
     with write_transaction() as conn:
         existing = conn.execute(
-            "SELECT inputs_hash, result FROM idempotency_keys WHERE key = ?",
+            "SELECT inputs_hash, result FROM idempotency_keys WHERE key = %s",
             (idempotency_key,),
         ).fetchone()
         if existing is not None:
@@ -70,10 +69,26 @@ def _execute(
             return Receipt(**json.loads(existing["result"]))
 
         receipt = work(conn)
-        ledger.append_on_conn(conn, "system", action_name, inputs, decision, session_id)
+
+        if verify is not None and not verify(conn):
+            # Rolls back the mutation and the ledger row together. The caller
+            # surfaces T-INDETERMINATE and escalates; it must not retry.
+            raise EffectUnverified(
+                f"{action_name} submitted but the effect could not be verified."
+            )
+
+        ledger.emit_tool(
+            conn,
+            session_id=session_id or "",
+            member_ref=inputs.get("member_id"),
+            tool=action_name,
+            params=inputs,
+            decision=decision,
+        )
         conn.execute(
-            "INSERT INTO idempotency_keys (key, inputs_hash, result, created_at) VALUES (?, ?, ?, ?)",
-            (idempotency_key, ih, receipt.model_dump_json(),
+            """INSERT INTO idempotency_keys (key, action, inputs_hash, result, created_at)
+               VALUES (%s, %s, %s, %s, %s)""",
+            (idempotency_key, action_name, ih, receipt.model_dump_json(),
              datetime.now(timezone.utc).isoformat()),
         )
         return receipt
@@ -94,15 +109,17 @@ def reverse_fee(
 
     def work(conn) -> Receipt:
         conn.execute(
-            "UPDATE accounts SET balance = balance - ? WHERE member_id = ?",
+            "UPDATE accounts SET balance = balance - %s WHERE member_id = %s",
             (fee_amount, member_id),
         )
         conn.execute(
-            "UPDATE transactions SET reversed = 1 WHERE txn_ref = ?", (txn_ref,)
+            "UPDATE transactions SET reversed = TRUE WHERE txn_ref = %s", (txn_ref,)
         )
-        new_balance = conn.execute(
-            "SELECT balance FROM accounts WHERE member_id = ?", (member_id,)
-        ).fetchone()["balance"]
+        new_balance = float(
+            conn.execute(
+                "SELECT balance FROM accounts WHERE member_id = %s", (member_id,)
+            ).fetchone()["balance"]
+        )
         return Receipt(
             reference=_ref("TXN"),
             action="reverse_fee",
@@ -111,7 +128,13 @@ def reverse_fee(
             detail=f"Late fee of {fee_amount} reversed against {txn_ref}; statement recalculated.",
         )
 
-    return _execute(idempotency_key, inputs, "reverse_fee", decision, session_id, work)
+    def verify(conn) -> bool:
+        row = conn.execute(
+            "SELECT reversed FROM transactions WHERE txn_ref = %s", (txn_ref,)
+        ).fetchone()
+        return bool(row and row["reversed"])
+
+    return _execute(idempotency_key, inputs, "reverse_fee", decision, session_id, work, verify)
 
 
 def block_card(
@@ -125,16 +148,20 @@ def block_card(
 
     def work(conn) -> Receipt:
         conn.execute(
-            "UPDATE accounts SET card_status = 'blocked' WHERE member_id = ?",
-            (member_id,),
+            "UPDATE accounts SET card_status = 'blocked' WHERE member_id = %s", (member_id,)
         )
         return Receipt(
-            reference=_ref("BLK"),
-            action="block_card",
+            reference=_ref("BLK"), action="block_card",
             detail=f"Card {card_id} blocked ({reason}).",
         )
 
-    return _execute(idempotency_key, inputs, "block_card", None, session_id, work)
+    def verify(conn) -> bool:
+        row = conn.execute(
+            "SELECT card_status FROM accounts WHERE member_id = %s", (member_id,)
+        ).fetchone()
+        return bool(row and row["card_status"] == "blocked")
+
+    return _execute(idempotency_key, inputs, "block_card", None, session_id, work, verify)
 
 
 def issue_replacement(
@@ -144,26 +171,26 @@ def issue_replacement(
     session_id: Optional[str] = None,
 ) -> Receipt:
     inputs = {"member_id": member_id, "card_id": card_id}
+    new_ref = _ref("CARD")
 
     def work(conn) -> Receipt:
-        new_ref = _ref("CARD")
         conn.execute(
             """INSERT INTO transactions (txn_ref, member_id, date, amount, description, kind)
-               VALUES (?, ?, ?, 0, ?, 'replacement')""",
-            (
-                new_ref,
-                member_id,
-                datetime.now(timezone.utc).isoformat(),
-                f"Replacement card issued for {card_id}",
-            ),
+               VALUES (%s, %s, %s, 0, %s, 'replacement')""",
+            (new_ref, member_id, datetime.now(timezone.utc).isoformat(),
+             f"Replacement card issued for {card_id}"),
         )
         return Receipt(
-            reference=new_ref,
-            action="issue_replacement",
-            detail=f"Replacement card issued for {card_id}. Arrives in 5–7 business days.",
+            reference=new_ref, action="issue_replacement",
+            detail=f"Replacement card issued for {card_id}. Arrives in 5-7 business days.",
         )
 
-    return _execute(idempotency_key, inputs, "issue_replacement", None, session_id, work)
+    def verify(conn) -> bool:
+        return conn.execute(
+            "SELECT 1 FROM transactions WHERE txn_ref = %s", (new_ref,)
+        ).fetchone() is not None
+
+    return _execute(idempotency_key, inputs, "issue_replacement", None, session_id, work, verify)
 
 
 def adjust_credit_limit(
@@ -177,17 +204,23 @@ def adjust_credit_limit(
 
     def work(conn) -> Receipt:
         conn.execute(
-            "UPDATE accounts SET credit_limit = ? WHERE member_id = ?",
+            "UPDATE accounts SET credit_limit = %s WHERE member_id = %s",
             (new_limit, member_id),
         )
         return Receipt(
-            reference=_ref("LMT"),
-            action="adjust_credit_limit",
-            amount=new_limit,
+            reference=_ref("LMT"), action="adjust_credit_limit", amount=new_limit,
             detail=f"Credit limit updated to {new_limit}.",
         )
 
-    return _execute(idempotency_key, inputs, "adjust_credit_limit", decision, session_id, work)
+    def verify(conn) -> bool:
+        row = conn.execute(
+            "SELECT credit_limit FROM accounts WHERE member_id = %s", (member_id,)
+        ).fetchone()
+        return bool(row and float(row["credit_limit"]) == float(new_limit))
+
+    return _execute(
+        idempotency_key, inputs, "adjust_credit_limit", decision, session_id, work, verify
+    )
 
 
 def open_underwriting_case(
@@ -203,12 +236,13 @@ def open_underwriting_case(
     def work(conn) -> Receipt:
         # No cases table (out of scope) — the ledger row IS the queued case.
         return Receipt(
-            reference=case_ref,
-            action="open_underwriting_case",
+            reference=case_ref, action="open_underwriting_case",
             detail=f"Underwriting case {case_ref} opened for {request_type}.",
         )
 
-    return _execute(idempotency_key, inputs, "open_underwriting_case", decision, session_id, work)
+    return _execute(
+        idempotency_key, inputs, "open_underwriting_case", decision, session_id, work
+    )
 
 
 def flag_vulnerability(
@@ -221,13 +255,19 @@ def flag_vulnerability(
 
     def work(conn) -> Receipt:
         conn.execute(
-            "UPDATE accounts SET vulnerability_flag = 1 WHERE member_id = ?",
-            (member_id,),
+            "UPDATE accounts SET vulnerability_flag = TRUE WHERE member_id = %s", (member_id,)
         )
         return Receipt(
-            reference=_ref("VUL"),
-            action="flag_vulnerability",
+            reference=_ref("VUL"), action="flag_vulnerability",
             detail="Account flagged for sensitive handling; collections activity suppressed.",
         )
 
-    return _execute(idempotency_key, inputs, "flag_vulnerability", None, session_id, work)
+    def verify(conn) -> bool:
+        row = conn.execute(
+            "SELECT vulnerability_flag FROM accounts WHERE member_id = %s", (member_id,)
+        ).fetchone()
+        return bool(row and row["vulnerability_flag"])
+
+    return _execute(
+        idempotency_key, inputs, "flag_vulnerability", None, session_id, work, verify
+    )

@@ -1,0 +1,64 @@
+# Local stores for the servicing agent.
+#
+#   docker compose up -d
+#   python scripts/init_stores.py     # schema + indexes + Splunk index
+#   python backend/seed.py            # four demo personas
+#
+# Splunk takes ~60s on first boot before HEC answers. init_stores.py waits for it.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: amex-postgres
+    environment:
+      POSTGRES_USER: amex
+      POSTGRES_PASSWORD: amex
+      POSTGRES_DB: servicing
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U amex -d servicing"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  mongo:
+    image: mongo:7
+    container_name: amex-mongo
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodata:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  splunk:
+    image: splunk/splunk:9.2
+    container_name: amex-splunk
+    environment:
+      SPLUNK_START_ARGS: --accept-license
+      SPLUNK_PASSWORD: Changeme123!
+      SPLUNK_HEC_TOKEN: amex-hec-token-local-dev
+    ports:
+      - "8000:8000"   # Splunk Web  -> http://localhost:8000  (admin / Changeme123!)
+      - "8088:8088"   # HEC
+      - "8089:8089"   # management API
+    volumes:
+      - splunkdata:/opt/splunk/var
+      - splunketc:/opt/splunk/etc
+    healthcheck:
+      test: ["CMD", "curl", "-fsk", "https://localhost:8089/services/server/info"]
+      interval: 15s
+      timeout: 5s
+      retries: 40
+
+volumes:
+  pgdata:
+  mongodata:
+  splunkdata:
+  splunketc:

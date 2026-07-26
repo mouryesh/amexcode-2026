@@ -20,6 +20,21 @@ class PolicyNotFound(ServicingError):
     http_status = 404
 
 
+class PolicyNotBound(ServicingError):
+    """No approved policy is registered for this intent — fail closed, hand off."""
+
+    http_status = 422
+
+
+class EffectUnverified(ServicingError):
+    """A write was submitted but its effect could not be confirmed.
+
+    Not a failure and not a success. Reconcile; never retry the write.
+    """
+
+    http_status = 503
+
+
 class IdempotencyConflict(ServicingError):
     """Duplicate idempotency key submitted with different inputs."""
 
