@@ -3,7 +3,9 @@
 The graph is the ONLY place routing logic lives. One file to read to understand
 the entire control flow:
 
-    START → classify_intent
+    START → security_filter
+      → [secret / injection]  → END (blocked, templated refusal)
+      → classify_intent
       → [low confidence]      → call_llm (clarify)         → END (awaiting)
       → [hardship / distress] → build_escalation           → END
       → check_slots
@@ -15,6 +17,10 @@ the entire control flow:
       → [DECLINE]             → call_llm (explain) → respond → END
       → [QUEUE]               → execute_tool → respond     → END
       → [APPROVE]             → execute_tool → respond     → END
+
+security_filter runs FIRST, before any classification or LLM call — a secret
+or an injection attempt never reaches the model at all, not just never gets
+stored (see shared/security_filter.py).
 
 If LangGraph is installed the real StateGraph is used; otherwise an equivalent
 pure-Python runner drives the same node functions and edge predicates, so the
@@ -32,6 +38,10 @@ from shared.schemas import Outcome
 # --------------------------------------------------------------------------- #
 # Edge predicates — shared by the LangGraph build and the fallback runner.
 # --------------------------------------------------------------------------- #
+def route_after_security(state: AgentState) -> str:
+    return "blocked" if state.get("security_blocked") else "proceed"
+
+
 def route_after_classify(state: AgentState) -> str:
     intent = state["intent"]
     if intent.label == "clarify":
@@ -66,6 +76,10 @@ def route_after_policy(state: AgentState) -> str:
 # Fallback runner (no LangGraph dependency)
 # --------------------------------------------------------------------------- #
 def _run_fallback(state: AgentState) -> AgentState:
+    state = nodes.security_filter(state)
+    if route_after_security(state) == "blocked":
+        return state
+
     state = nodes.classify_intent(state)
     branch = route_after_classify(state)
 
@@ -104,6 +118,7 @@ def _build_langgraph():
     from langgraph.graph import END, START, StateGraph
 
     g = StateGraph(AgentState)
+    g.add_node("security_filter", nodes.security_filter)
     g.add_node("classify_intent", nodes.classify_intent)
     g.add_node("check_slots", nodes.check_slots)
     g.add_node("run_policy", nodes.run_policy)
@@ -112,7 +127,12 @@ def _build_langgraph():
     g.add_node("build_escalation", nodes.build_escalation)
     g.add_node("respond_to_member", nodes.respond_to_member)
 
-    g.add_edge(START, "classify_intent")
+    g.add_edge(START, "security_filter")
+    g.add_conditional_edges(
+        "security_filter",
+        route_after_security,
+        {"blocked": END, "proceed": "classify_intent"},
+    )
     g.add_conditional_edges(
         "classify_intent",
         route_after_classify,

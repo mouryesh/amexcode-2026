@@ -49,3 +49,20 @@ def test_count_prior_declines_scoped_to_policy_and_reason():
     assert sessions.count_prior_declines(
         "s2", "fee.late.courtesy_waiver", "WAIVER_FREQUENCY_EXCEEDED"
     ) == 0
+
+
+def test_record_turn_redacts_pii_before_storage():
+    _fresh()
+    sessions.record_turn("s1", "MEM-X", "member",
+                         "my card is 4111111111111111 and email is a@b.com")
+    stored = sessions.get_history("s1")[0]["text"]
+    assert "4111111111111111" not in stored
+    assert "a@b.com" not in stored
+    assert "[REDACTED_CARD_NUMBER]" in stored
+    assert "[REDACTED_EMAIL]" in stored
+
+
+def test_record_turn_preserves_intent_bearing_text():
+    _fresh()
+    sessions.record_turn("s1", "MEM-X", "member", "please waive my late fee")
+    assert sessions.get_history("s1")[0]["text"] == "please waive my late fee"

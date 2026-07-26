@@ -1,8 +1,11 @@
 """api/routes.py — three endpoints. No business logic; pure HTTP<->schema translation.
 
-Imports: agent.graph, backend.ledger, backend.sessions, shared.schemas, shared.exceptions.
+Imports: agent.graph, backend.ledger, backend.sessions, shared.schemas,
+shared.exceptions, shared.observability.
 """
 from __future__ import annotations
+
+import time
 
 from fastapi import APIRouter, HTTPException
 
@@ -10,6 +13,7 @@ from agent.graph import run
 from agent.state import new_state
 from backend import ledger, sessions
 from shared.exceptions import ServicingError
+from shared.observability import log_event
 from shared.schemas import AgentRequest, AgentResponse
 
 router = APIRouter()
@@ -18,6 +22,7 @@ router = APIRouter()
 @router.post("/agent/message", response_model=AgentResponse)
 def agent_message(req: AgentRequest) -> AgentResponse:
     """Run the full LangGraph pipeline for one member message."""
+    start = time.perf_counter()
     history = sessions.get_history(req.session_id)
     state = new_state(
         session_id=req.session_id,
@@ -26,15 +31,37 @@ def agent_message(req: AgentRequest) -> AgentResponse:
         confirm=req.confirm,
         reauthenticated=req.reauthenticated,
         history=history,
+        selected_option=req.selected_option,
     )
     try:
         result = run(state)
     except ServicingError as exc:
+        log_event(
+            "agent_message",
+            session_id=req.session_id,
+            member_id=req.member_id,
+            success=False,
+            error_type=type(exc).__name__,
+            latency_ms=round((time.perf_counter() - start) * 1000, 1),
+        )
         raise HTTPException(status_code=exc.http_status, detail=str(exc))
 
     decision = result.get("decision_records") or []
     last_decision = decision[-1] if decision else None
     intent = result.get("intent")
+
+    log_event(
+        "agent_message",
+        session_id=req.session_id,
+        member_id=req.member_id,
+        intent=intent.label if intent else None,
+        confidence=round(intent.confidence, 3) if intent else None,
+        outcome=last_decision.outcome.value if last_decision else None,
+        escalate=result.get("escalate", False),
+        awaiting_member=result.get("awaiting_member", False),
+        success=True,
+        latency_ms=round((time.perf_counter() - start) * 1000, 1),
+    )
 
     sessions.record_turn(
         req.session_id, req.member_id, "member", req.message,

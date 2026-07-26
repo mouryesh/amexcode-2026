@@ -1,4 +1,8 @@
-# Illustrative / synthetic card replacement policy.
+# Card replacement policy — the specific thresholds (fraud_hold flag,
+# 30-day dedup window) are project_control, but the general SHAPE of the
+# fraud/security branch matches real Amex India public guidance: a lost/
+# stolen/compromised card is routed through a dedicated security process,
+# not treated as routine self-serve reissue (SRC-LOST-STOLEN, SRC-REPORT-FRAUD).
 #
 # Card replacement is a propose_confirm action: the agent proposes, the member
 # confirms, then the write commits. This policy governs whether a replacement
@@ -7,6 +11,8 @@
 policy_id: card.replacement
 version: v1
 description: Assess eligibility to issue a replacement card.
+source_tag: project_control
+source_ref: approved_architecture
 
 default:
   outcome: APPROVE

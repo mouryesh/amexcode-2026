@@ -75,7 +75,12 @@ def _credit_facts(**overrides):
          Outcome.QUEUE, "INCOME_DATA_STALE"),
         (_credit_facts(), Outcome.APPROVE, "LIMIT_INCREASE_GRANTED"),
         (_credit_facts(utilisation=0.95), Outcome.DECLINE, "HIGH_UTILISATION"),
-        (_credit_facts(tenure_months=8), Outcome.QUEUE, "THIN_FILE"),
+        # Real, sourced Amex India rule: eligible only after 6 completed
+        # months of card enrollment (SRC-CLI) — below that, decline.
+        (_credit_facts(tenure_months=3), Outcome.DECLINE, "BELOW_MINIMUM_ENROLLMENT"),
+        # Exact boundary: 6 months IS eligible (rule is "after the first six
+        # months", i.e. tenure_months < 6 declines, 6 itself qualifies).
+        (_credit_facts(tenure_months=6), Outcome.APPROVE, "LIMIT_INCREASE_GRANTED"),
         (_credit_facts(distress_signals=True), Outcome.ESCALATE, "HARDSHIP_SIGNAL"),
     ],
 )
@@ -83,6 +88,18 @@ def test_credit_branches(facts, expected, reason_code):
     d = evaluate("credit.limit_increase", facts)
     assert d.outcome == expected
     assert d.reason_code == reason_code
+
+
+def test_credit_below_minimum_enrollment_is_sourced_not_illustrative():
+    d = evaluate("credit.limit_increase", _credit_facts(tenure_months=3))
+    assert d.source_tag == "amex_public"
+    assert d.source_ref == "SRC-CLI"
+
+
+def test_credit_auto_grant_is_tagged_project_control():
+    d = evaluate("credit.limit_increase", _credit_facts())
+    assert d.outcome == Outcome.APPROVE
+    assert d.source_tag == "project_control"
 
 
 # --------------------------- error handling -------------------------------- #

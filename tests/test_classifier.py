@@ -13,6 +13,9 @@ from collections import defaultdict
 import pytest
 
 from agent.classifier import TAXONOMY, classify
+from agent.graph import run
+from agent.state import new_state
+from backend.seed import seed
 
 # (utterance, gold_label). 'clarify' is the fallback for genuinely ambiguous
 # input; hardship phrases are labelled hardship even when a request co-occurs.
@@ -114,3 +117,48 @@ def test_each_labelled_utterance(utterance, gold):
 def test_hardship_beats_cooccurring_request():
     # A hardship phrase alongside a fee request must classify as hardship.
     assert _predict("I can't pay and I want my late fee waived") == "hardship"
+
+
+# Persona, message, and whether we EXPECT first-contact resolution. Vikram is
+# deliberately expected to NOT resolve on first contact — escalating hardship
+# instead of answering it alone is correct behaviour, not a shortfall. A 100%
+# FCR across all four would actually indicate a bug (duty-of-care bypassed),
+# not a win.
+FCR_SCENARIOS = [
+    ("MEM-PRIYA", "please waive my late fee", True),
+    ("MEM-RAHUL", "please waive my late fee", True),
+    ("MEM-ANANYA", "I'd like to raise my credit limit", True),
+    ("MEM-VIKRAM", "I lost my job and can't pay this month", False),
+]
+
+
+def _resolved_first_contact(member_id: str, message: str) -> bool:
+    """True if the agent produced a complete answer in one turn — no follow-up
+    question needed (awaiting_member) and no human handoff (escalate). A
+    DECLINE or QUEUE outcome still counts as resolved: the agent gave the
+    member a final, actionable answer without leaving the conversation open."""
+    result = run(new_state(f"fcr-{member_id}", member_id, message))
+    return not result.get("awaiting_member", False) and not result.get("escalate", False)
+
+
+def test_first_contact_resolution_rate(capsys):
+    """Task 5 of the problem statement: 'test and optimize... for first-contact
+    resolution rate'. Named as a required metric in the original architecture
+    doc's test_classifier.py spec but not previously computed — this is that
+    metric, across the four demo personas."""
+    seed()
+    resolved = 0
+    print("\n\n=== First-contact resolution ===")
+    for member_id, message, expected in FCR_SCENARIOS:
+        actual = _resolved_first_contact(member_id, message)
+        resolved += actual
+        mark = "resolved" if actual else "escalated/awaiting"
+        print(f"  {member_id:12} -> {mark:20} (expected: "
+              f"{'resolved' if expected else 'escalated/awaiting'})")
+        assert actual == expected, (
+            f"{member_id}: expected first-contact-resolved={expected}, got {actual}"
+        )
+
+    rate = resolved / len(FCR_SCENARIOS)
+    print(f"\nFCR: {rate:.0%} ({resolved}/{len(FCR_SCENARIOS)}) — "
+          f"1 of 4 (Vikram/hardship) is EXPECTED to escalate, not a miss.")

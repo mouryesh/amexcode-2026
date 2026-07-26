@@ -3,19 +3,22 @@
 Each takes state, does exactly one thing, and returns updated state. No routing
 logic lives here — the graph decides what runs next (see graph.py).
 
-Imports: classifier, llm, tools, policy_engine, escalation, backend.accounts.
+Imports: classifier, llm, tools, policy_engine, escalation, templates,
+backend.accounts, backend.sessions, shared.security_filter, shared.observability.
 """
 from __future__ import annotations
 
 from typing import Any
 
-from agent import escalation, tools
+from agent import escalation, templates, tools
 from agent.classifier import classify, is_hardship
 from agent.llm import LLMUnavailable, llm
 from agent.policy_engine import evaluate
 from agent.state import AgentState
 from backend import accounts, sessions
+from shared import security_filter as secfilter
 from shared.config import config
+from shared.observability import log_event
 from shared.schemas import Intent, Outcome
 
 # The slots a member must supply (directly or via auto-resolution from the read
@@ -51,9 +54,57 @@ def _prose(system: str, user: str, fallback: str) -> str:
     return fallback
 
 
+_MAX_CONTEXT_TURNS = 4
+
+
+def _recent_context(state: AgentState) -> str:
+    """A small, BOUNDED summary of recent turns for grounding LLM prose.
+
+    Excludes the current (last) message — callers pass that separately. Capped
+    at _MAX_CONTEXT_TURNS regardless of how long the session has run, so a
+    long-running conversation never balloons the prompt: send only what's
+    needed to sound continuous, not the full unbounded transcript.
+    """
+    prior = state["messages"][:-1][-_MAX_CONTEXT_TURNS:]
+    if not prior:
+        return ""
+    lines = [f"{m['role']}: {m['text']}" for m in prior]
+    return "Recent conversation so far:\n" + "\n".join(lines) + "\n\n"
+
+
 # --------------------------------------------------------------------------- #
 # Nodes
 # --------------------------------------------------------------------------- #
+def security_filter(state: AgentState) -> AgentState:
+    """FIRST pipeline stage — runs before classification, before any LLM call.
+
+    Detects secrets (PIN/OTP/CVV/password/full card number) and prompt-
+    injection attempts via pure pattern matching (shared/security_filter.py).
+    If either fires, the turn short-circuits here: no classification, no LLM
+    call, no account read. This is what keeps a real secret from ever leaving
+    the process — shared/redaction.py only protects data already IN the
+    pipeline (at persistence); this stops it from entering at all.
+    """
+    message = _last_member_message(state)
+
+    if secfilter.contains_secret(message):
+        log_event("security_event", session_id=state["session_id"],
+                  member_id=state["member_id"], kind="secret_detected")
+        state["reply"] = templates.render("T-SECRET-REDACTED")
+        state["security_blocked"] = True
+        return state
+
+    if secfilter.contains_injection(message):
+        log_event("security_event", session_id=state["session_id"],
+                  member_id=state["member_id"], kind="prompt_injection")
+        state["reply"] = templates.render("T-PROMPT-INJECTION")
+        state["security_blocked"] = True
+        return state
+
+    state["security_blocked"] = False
+    return state
+
+
 def classify_intent(state: AgentState) -> AgentState:
     """Run the classifier; load account facts (incl. distress signal)."""
     message = _last_member_message(state)
@@ -83,15 +134,29 @@ def check_slots(state: AgentState) -> AgentState:
     member = accounts.get_member(member_id)
 
     if intent == "fee_waiver":
-        # Find the most recent un-reversed fee charge to waive.
-        fee_txn = next(
-            (t for t in accounts.get_transactions(member_id, limit=20)
-             if t["kind"] == "fee" and not t["reversed"]),
-            None,
-        )
-        if fee_txn:
-            slots.setdefault("fee_amount", fee_txn["amount"])
-            slots.setdefault("txn_ref", fee_txn["txn_ref"])
+        # Find EVERY un-reversed fee — never silently pick just the newest
+        # (POL-GLOBAL-005 "no silent target selection"). One match auto-
+        # resolves; more than one is surfaced for the member to choose.
+        fee_txns = [t for t in accounts.get_transactions(member_id, limit=20)
+                    if t["kind"] == "fee" and not t["reversed"]]
+        if len(fee_txns) == 1:
+            slots.setdefault("fee_amount", fee_txns[0]["amount"])
+            slots.setdefault("txn_ref", fee_txns[0]["txn_ref"])
+        elif len(fee_txns) > 1:
+            selected = state.get("selected_option")
+            if selected is not None and 1 <= selected <= len(fee_txns):
+                # Member answered a prior disambiguation question — resolve it.
+                chosen = fee_txns[selected - 1]
+                slots.setdefault("fee_amount", chosen["amount"])
+                slots.setdefault("txn_ref", chosen["txn_ref"])
+            else:
+                # Don't pick — ask. Candidates re-derived fresh each turn (not
+                # persisted structurally), so a stale choice can never apply.
+                state["ambiguous_field"] = "txn_ref"
+                state["ambiguous_candidates"] = [
+                    {"amount": t["amount"], "txn_ref": t["txn_ref"], "date": t["date"]}
+                    for t in fee_txns
+                ]
 
     elif intent in ("card_replacement",):
         slots.setdefault("card_id", member["card_id"])
@@ -113,11 +178,13 @@ def check_slots(state: AgentState) -> AgentState:
 
     # Completeness is judged only against MEMBER-provided slots. Decision-derived
     # slots (new_limit, request_type) are filled in execute_tool once the policy
-    # outcome is known, so they must not gate the conversation here.
+    # outcome is known, so they must not gate the conversation here. An
+    # unresolved ambiguous_field also blocks completeness — same "ask, don't
+    # act" routing as a missing slot.
     required = MEMBER_SLOTS.get(intent, ())
     missing = [s for s in required if slots.get(s) in (None, "")]
-    state["missing_slots"] = missing  # type: ignore[typeddict-unknown-key]
-    state["slots_complete"] = len(missing) == 0  # type: ignore[typeddict-unknown-key]
+    state["missing_slots"] = missing
+    state["slots_complete"] = len(missing) == 0 and not state.get("ambiguous_field")
     return state
 
 
@@ -161,43 +228,56 @@ def call_llm(state: AgentState) -> AgentState:
     """
     intent = state["intent"]
     message = _last_member_message(state)
+    context = _recent_context(state)
 
     # 1. Below-threshold classification → ask a clarifying question.
     if intent.label == "clarify":
         state["reply"] = _prose(
             "You are a helpful, concise credit-card servicing agent.",
-            f"The member said: '{message}'. You are not sure what they need. "
-            "Ask one short, friendly clarifying question.",
+            f"{context}The member said: '{message}'. You are not sure what they "
+            "need. Ask one short, friendly clarifying question. If the recent "
+            "conversation above already answers part of it, don't ask again.",
             "I want to make sure I help with the right thing — could you tell me "
             "a bit more about what you'd like to do with your card or account?",
         )
         state["awaiting_member"] = True
         return state
 
-    # 2. Missing slots → ask for the specific parameter.
+    # 2. Ambiguous slot (multiple candidates) → surface options via the
+    # approved template, never free LLM prose — the choices themselves are
+    # facts (amounts, references) that must not be paraphrased or invented.
+    if state.get("ambiguous_field"):
+        candidates = state.get("ambiguous_candidates", [])
+        options = "\n".join(
+            f"{i + 1}. Rs {c['amount']} from {c['date'][:10]} (ref {c['txn_ref']})"
+            for i, c in enumerate(candidates)
+        )
+        state["reply"] = templates.render("T-SELECT-ITEM", options=options)
+        state["awaiting_member"] = True
+        return state
+
+    # 3. Missing slots → ask for the specific parameter.
     if not state.get("slots_complete", True):
         missing = ", ".join(state.get("missing_slots", []))  # type: ignore[arg-type]
         pretty = {"address": "your new address"}.get(missing, missing)
         state["reply"] = _prose(
             "You are a helpful, concise credit-card servicing agent.",
-            f"To handle the member's '{intent.label}' request you still need: "
-            f"{missing}. Ask for it in one short sentence.",
+            f"{context}To handle the member's '{intent.label}' request you still "
+            f"need: {missing}. Ask for it in one short sentence.",
             f"Sure — to continue I just need {pretty}. Could you share that?",
         )
         state["awaiting_member"] = True
         return state
 
-    # 3. A DECLINE decision → explain it with the cited reason and appeal route.
+    # 4. A DECLINE decision → the reply IS the policy's own reason_text,
+    # verbatim. No LLM call: per "the LLM may explain a result only through an
+    # approved template keyed by reason_code, it cannot invent eligibility" —
+    # decision.reason_text is already the authored, versioned, policy-sourced
+    # explanation (policies/*.yaml), so rewriting it through the LLM would only
+    # add risk of it drifting from what the policy actually said.
     decision = state["decision_records"][-1] if state.get("decision_records") else None
     if decision and decision.outcome == Outcome.DECLINE:
-        state["reply"] = _prose(
-            "You are a credit-card servicing agent. Explain a decision the member "
-            "may not like, warmly and without over-apologising. Cite the reason "
-            "and offer the appeal route. Do not invent policy details.",
-            f"Decision reason: {decision.reason_text} (code {decision.reason_code}). "
-            "Write the member-facing explanation.",
-            decision.reason_text,
-        )
+        state["reply"] = decision.reason_text
         return state
 
     return state

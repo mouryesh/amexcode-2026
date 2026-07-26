@@ -156,3 +156,50 @@ Still to design when this gets built:
     is new parsing logic, not a plain missing-slot fill.
   - Whether to reuse this same mechanism for card_id and any other slot that
     could someday have more than one live candidate per member.
+
+
+5. DATA GOVERNANCE (RETENTION/LINEAGE) IS NOT THE SAME AS THE AUDIT LEDGER
+-----------------------------------------------------------------------------
+Status: OPEN — identified 2026-07-26, source: "A Reference Architecture for
+On-Premises Chatbots in Banks and Public Institutions" (Koch et al., GI
+Informatik 2021) — a peer-reviewed reference architecture validated against
+two real deployments (TeamBank AG, German Federal Employment Agency).
+
+Question:
+  backend/ledger.py's audit_ledger answers "what decision was made and why" —
+  tamper-proof, append-only, deliberately NEVER deletable. It does NOT answer
+  "how long do we retain this member's raw data" or "how do we honour a
+  deletion/erasure request" — a different concern entirely. Do we need a
+  SEPARATE data-governance layer for retention/lineage, distinct from the
+  decision-audit trail?
+
+Why this matters:
+  This is the concrete shape of the GDPR-right-to-erasure-vs-immutable-ledger
+  tension already noted as a production difficulty (see production-readiness
+  discussion): an append-only hash chain structurally CANNOT delete a row
+  without breaking every hash after it, so "delete my data" can never be
+  honoured by deleting FROM the ledger. The paper's real-world validation:
+  TeamBank runs a dedicated Data Governance Center (built on Collibra)
+  specifically to track data lineage and retention periods per BCBS 239/GDPR
+  — kept as a SEPARATE system from the chatbot's decision logic on purpose,
+  not folded into the audit trail. That's independent confirmation this is a
+  genuinely distinct concern, not something the ledger can be stretched to cover.
+
+What we already partially have:
+  - backend/sessions.py now redacts PII from stored message TEXT before
+    persistence (shared/redaction.py, done 2026-07-26) — reduces what's at
+    risk, but does not address retention periods or deletion requests for
+    what IS legitimately stored (account facts, decision records).
+  - The audit_ledger's PII exposure is already fairly limited (decision
+    records reference member_id + structured facts, not raw free text).
+
+Still to decide:
+  - Do we need an explicit retention policy (e.g. auto-purge session_messages
+    text after N days) separate from the permanent ledger?
+  - If a member requested deletion, what's the actual mechanism — since the
+    ledger can't delete, would deletion mean removing the member_id linkage
+    while leaving the hash-chained facts anonymous (a common pattern:
+    right-to-erasure via de-identification rather than row deletion)?
+  - Out of scope to BUILD for the hackathon (this is a real infra project,
+    not a quick fix) — but worth being able to articulate the answer in Q&A,
+    since it's a predictable question given the ledger is a headline feature.

@@ -11,7 +11,11 @@ Writes to the reconciled `messages` table (see BACKEND_RECONCILIATION.md), the
 single conversation transcript that both the agent layer and the audit-viewer
 replay read from.
 
-Imports: backend.database only.
+Text is redacted (shared.redaction) before it's persisted — PII AT REST, not
+just in transit. This is the single choke point every persisted message goes
+through, so redaction happens here once rather than at every call site.
+
+Imports: backend.database, shared.redaction.
 """
 from __future__ import annotations
 
@@ -19,6 +23,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from backend.database import db_session
+from shared.redaction import redact
 
 
 def record_turn(
@@ -35,7 +40,10 @@ def record_turn(
     """Append one turn (a member message or an agent reply) to the session.
 
     `turn_index` is assigned per session (0, 1, 2, ...) so the transcript has a
-    stable, gap-free order independent of the global autoincrement id.
+    stable, gap-free order independent of the global autoincrement id. `text`
+    is redacted before storage — the member's live turn still gets processed
+    against the raw, unredacted message (this function is only ever called
+    AFTER the graph has already used it); only the persisted copy is stripped.
     """
     with db_session() as conn:
         next_turn = conn.execute(
@@ -48,7 +56,7 @@ def record_turn(
                 decision_outcome, decision_reason_code, policy_id, created_at)
                VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
             (
-                session_id, member_id, next_turn, role, text, intent, confidence,
+                session_id, member_id, next_turn, role, redact(text), intent, confidence,
                 decision_outcome, decision_reason_code, policy_id,
                 datetime.now(timezone.utc).isoformat(),
             ),

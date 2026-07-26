@@ -83,6 +83,11 @@ def evaluate(policy_id: str, account_facts: dict[str, Any]) -> Decision:
     """
     policy = _load_policy(policy_id)
     version = policy.get("version", "unversioned")
+    # Policy-level source_tag/source_ref are the fallback; a rule may override
+    # with its own (e.g. one rule is a real sourced Amex India rule while a
+    # sibling rule in the same file is an illustrative project_control).
+    default_source_tag = policy.get("source_tag")
+    default_source_ref = policy.get("source_ref")
 
     for rule in policy["rules"]:
         conditions = rule.get("when", [])
@@ -99,6 +104,8 @@ def evaluate(policy_id: str, account_facts: dict[str, Any]) -> Decision:
                 policy_version=version,
                 inputs_used=read_fields,
                 rule_id=rule.get("id"),
+                source_tag=rule.get("source_tag", default_source_tag),
+                source_ref=rule.get("source_ref", default_source_ref),
             )
 
     default = policy["default"]
@@ -110,4 +117,6 @@ def evaluate(policy_id: str, account_facts: dict[str, Any]) -> Decision:
         policy_version=version,
         inputs_used=dict(account_facts),
         rule_id="default",
+        source_tag=default.get("source_tag", default_source_tag),
+        source_ref=default.get("source_ref", default_source_ref),
     )

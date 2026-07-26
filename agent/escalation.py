@@ -4,12 +4,20 @@ The structured handoff a human agent receives. This is a scored deliverable and
 a first-class artifact: a stranger should be able to act on it in ten seconds.
 It is not a side effect of ending a conversation.
 
-Imports: shared.schemas only.
+Transcript text is redacted (shared.redaction) before being handed to the
+human agent — the specialist needs the account facts (already structured,
+already legitimate to see) but not a card/account number the member happened
+to type. Redaction only strips PII-shaped substrings (digit/email patterns);
+sentiment-bearing phrases ("can't pay", "lost my job") are untouched, so
+detect_sentiment works identically on the redacted copy.
+
+Imports: shared.schemas, shared.redaction.
 """
 from __future__ import annotations
 
 from typing import Any
 
+from shared.redaction import redact
 from shared.schemas import Decision, EscalationPacket
 
 # Very small lexicon for sentiment — enough to surface tone to the human agent
@@ -55,12 +63,16 @@ def build_escalation_packet(
     decisions: list[Decision],
 ) -> EscalationPacket:
     """Assemble the complete-context handoff document."""
-    sentiment = detect_sentiment(messages)
+    # Redact once, up front: covers both prior turns (already redacted when
+    # stored via sessions.record_turn) and the CURRENT turn's message (still
+    # raw at this point in the pipeline — record_turn hasn't run yet this turn).
+    redacted_messages = [{"role": m["role"], "text": redact(m["text"])} for m in messages]
+    sentiment = detect_sentiment(redacted_messages)
     return EscalationPacket(
         session_id=session_id,
         member_id=member_id,
         reason=reason,
-        transcript=list(messages),
+        transcript=redacted_messages,
         facts_read=dict(facts_read),
         actions_attempted=list(actions_attempted),
         decisions=list(decisions),

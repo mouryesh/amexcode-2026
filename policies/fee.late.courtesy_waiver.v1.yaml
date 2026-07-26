@@ -1,8 +1,18 @@
 # Illustrative / synthetic courtesy late-fee waiver policy.
 #
-# THESE THRESHOLDS ARE ILLUSTRATIVE. Amex does not publish its real
-# courtesy-waiver rules. The point is that they live in a versioned document,
-# not a prompt — swap in the real credit policy and nothing else changes.
+# THESE THRESHOLDS ARE ILLUSTRATIVE, ENTIRELY project_control. Researched
+# Amex India public sources confirm there is NO universal published
+# courtesy-waiver entitlement — Amex India publishes fee AMOUNTS (SRC-FEES)
+# but explicitly does not commit to any auto-waiver rule. Any claim like
+# "one waiver per 12 months is Amex policy" would be a fabrication; do not
+# make it. The honest framing (matching real Amex India guidance): "I can
+# submit a request, but there is no published rule that guarantees a
+# courtesy waiver — this needs account-specific review."
+#
+# The point of keeping this as a versioned document rather than a prompt
+# still holds even though the thresholds are illustrative: swap in the real
+# internal courtesy-waiver policy the moment it's approved, and nothing else
+# in the system changes.
 #
 # Rules are evaluated top-to-bottom; the FIRST rule whose conditions all match
 # wins. If none match, `default` is returned.
@@ -10,6 +20,8 @@
 policy_id: fee.late.courtesy_waiver
 version: v1
 description: Courtesy waiver of a late payment fee, evaluated on account facts.
+source_tag: project_control
+source_ref: approved_architecture
 
 default:
   outcome: QUEUE

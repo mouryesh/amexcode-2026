@@ -1,11 +1,22 @@
-# Illustrative / synthetic credit limit increase policy.
+# Credit limit increase policy — real Amex India eligibility gate + an
+# illustrative auto-grant layer on top.
 #
-# THESE THRESHOLDS ARE ILLUSTRATIVE. The point is that they live in a versioned
-# document, not a prompt. Rules evaluate top-to-bottom; first full match wins.
+# The ELIGIBILITY GATE (thin_file rule below, 6-month threshold) is a REAL,
+# SOURCED Amex India public rule: "Request can be made after successfully
+# completing the first six months of Card enrollment." (source_ref below).
+#
+# The AUTO-GRANT (qualified_increase rule) is NOT how Amex India actually
+# decides limit increases — real process is eligibility → document review
+# (Form 16 / ITR) → underwriting/human decision, never an automated grant.
+# We keep a project_control auto-approve path here anyway, clearly tagged,
+# because a live "here's your outcome" demo beat is worth more than
+# perfect fidelity — but it must never be presented as real Amex behaviour.
 
 policy_id: credit.limit_increase
 version: v1
 description: Assess an unsecured credit limit increase request on account facts.
+source_tag: project_control
+source_ref: approved_architecture
 
 default:
   outcome: QUEUE
@@ -38,18 +49,28 @@ rules:
       your credit score.
     rationale: Responsible lending requires current income; stale data → human review.
 
-  # Thin file (short tenure) also queues rather than auto-approving.
+  # REAL, SOURCED Amex India rule: eligibility to even APPLY requires 6
+  # completed months of card enrollment. Below that, decline with the actual
+  # published wording — do not apply the US 60-day rule (that's a different
+  # market and is explicitly prohibited from being claimed as India policy).
   - id: thin_file
+    source_tag: amex_public
+    source_ref: SRC-CLI
     when:
-      - { field: tenure_months, op: lt, value: 12 }
-    outcome: QUEUE
-    reason_code: THIN_FILE
+      - { field: tenure_months, op: lt, value: 6 }
+    outcome: DECLINE
+    reason_code: BELOW_MINIMUM_ENROLLMENT
     reason_text: >-
-      Because your account is relatively new, we'll review this request through
-      underwriting rather than deciding it automatically.
-    rationale: Short history is insufficient signal to auto-approve exposure.
+      Amex India states that a credit limit increase can be applied for after
+      the first six months of card enrollment. You can request this again
+      once you've completed six months on this account.
+    rationale: >-
+      Sourced, published Amex India eligibility gate — not a project_control
+      guess. See source_registry: SRC-CLI.
 
-  # High utilisation is a risk signal — decline auto increase.
+  # High utilisation is a risk signal — decline auto increase. (This
+  # THRESHOLD is a project_control judgment call, not a published number —
+  # Amex India does not publish a utilisation cutoff.)
   - id: high_utilisation
     when:
       - { field: utilisation, op: gte, value: 0.9 }
@@ -59,12 +80,16 @@ rules:
       Your current balance is close to your existing limit. We're unable to
       increase it right now. Reducing your balance first will help a future
       request.
-    rationale: Very high utilisation signals repayment risk.
+    rationale: Very high utilisation signals repayment risk; illustrative threshold.
 
-  # Seasoned, well-utilised, current income → approve a modest increase.
+  # project_control auto-grant — NOT real Amex India behaviour (real process
+  # is eligibility + documents + underwriting/human decision). Kept for the
+  # demo, explicitly and permanently tagged as such.
   - id: qualified_increase
+    source_tag: project_control
+    source_ref: approved_architecture
     when:
-      - { field: tenure_months, op: gte, value: 12 }
+      - { field: tenure_months, op: gte, value: 6 }
       - { field: income_staleness_months, op: lte, value: 12 }
       - { field: utilisation, op: lt, value: 0.6 }
       - { field: late_payments_12m, op: eq, value: 0 }
@@ -73,4 +98,8 @@ rules:
     reason_text: >-
       Good news — based on your account history we've approved a credit limit
       increase.
-    rationale: Seasoned, current, low-utilisation, on-time members qualify.
+    rationale: >-
+      Illustrative auto-grant for the demo. Real Amex India process requires
+      document review (Form 16 / latest ITR) and an underwriting or human
+      decision — this project_control path exists for demo purposes only and
+      must not be presented as real Amex India auto-approval behaviour.
