@@ -82,6 +82,10 @@ class Config:
     # --- Session behaviour --------------------------------------------------- #
     DECLINE_REPEAT_ESCALATE_THRESHOLD: int = int(_env("DECLINE_REPEAT_ESCALATE_THRESHOLD", "1"))
     SLOT_MAX_ATTEMPTS: int = int(_env("SLOT_MAX_ATTEMPTS", "3"))
+    # A slot value the extractor read out of free text is only accepted at or
+    # above this confidence. Below it the value is discarded and the member is
+    # asked again — a wrong address written confidently is worse than a re-ask.
+    SLOT_EXTRACT_MIN_CONFIDENCE: float = float(_env("SLOT_EXTRACT_MIN_CONFIDENCE", "0.7"))
     CLARIFY_MAX_QUESTIONS: int = int(_env("CLARIFY_MAX_QUESTIONS", "2"))
     CONFIRM_TTL_S: int = int(_env("CONFIRM_TTL_S", "120"))
     FLOW_IDLE_TIMEOUT_S: int = int(_env("FLOW_IDLE_TIMEOUT_S", "600"))

@@ -33,6 +33,13 @@ class AgentState(TypedDict, total=False):
     slots: dict[str, Any]
     slots_complete: bool
     missing_slots: list[str]
+    # True when a slot has been asked for SLOT_MAX_ATTEMPTS times without a
+    # usable answer. The graph routes this to escalation rather than asking a
+    # fourth time — an unbounded ask loop is a member trapped with no human.
+    slots_exhausted: bool
+    # Slot name -> value the extractor filled this turn, kept for the audit row
+    # so a reviewer can see what the model read out of free text.
+    slots_extracted: dict[str, Any]
 
     # Conversation -----------------------------------------------------------
     # Each message: {"role": "member"|"agent", "text": "..."}
@@ -61,6 +68,14 @@ class AgentState(TypedDict, total=False):
     # or an injection attempt and short-circuited the turn — nothing past that
     # node runs: no classification, no LLM call, no account read.
     security_blocked: bool
+
+    # Fail-closed ------------------------------------------------------------
+    # Set by nodes.fail_closed to the catalogue operation that was correctly
+    # recognised but has no approved policy. Carried into the escalation packet
+    # so the handoff names the exact operation and its owning flow.
+    unmapped_operation: Optional[str]
+    # Set when the loop detector breaks a repeating exchange.
+    loop_broken: bool
 
     # Disambiguation -----------------------------------------------------
     # Set by check_slots when a slot has MORE THAN ONE plausible candidate
@@ -92,6 +107,8 @@ def new_state(session_id: str, member_id: str, message: str,
         slots={},
         slots_complete=True,
         missing_slots=[],
+        slots_exhausted=False,
+        slots_extracted={},
         messages=messages,
         confirm=confirm,
         reauthenticated=reauthenticated,
@@ -104,6 +121,8 @@ def new_state(session_id: str, member_id: str, message: str,
         reply="",
         awaiting_member=False,
         security_blocked=False,
+        unmapped_operation=None,
+        loop_broken=False,
         ambiguous_field=None,
         ambiguous_candidates=[],
     )

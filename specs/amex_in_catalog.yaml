@@ -1,0 +1,797 @@
+# specs/amex_in_catalog.yaml
+#
+# The routing projection of the three reference specs, in the one shape the
+# runtime needs: every operation, the domain that owns it, the state profile
+# that scopes its reads, the flow that services it, and whether it may execute.
+#
+# Extracted from:
+#   01_AMEX_INDIA_INTENT_CATALOG.yaml   domains, operations, acts, modifiers
+#   02_AMEX_INDIA_STATE_SCHEMAS.yaml    ST-* profiles, lifecycle enums
+#   03_AMEX_INDIA_POLICY_ACTIONS.yaml   FL-* flows, templates, priority order
+#
+# Loaded by agent/catalogue.py. This file is DATA — adding an operation here
+# makes it routable without touching a line of Python.
+#
+# read_only decides the fail-closed branch (POL-GLOBAL-011): a read-only
+# operation with no policy may be answered from an approved source; a
+# consequential one must not execute, and builds a T-UNMAPPED handoff.
+
+spec:
+  id: AMEX-IN-CATALOG-1.0
+  market: IN
+  locale: en-IN
+  domains: 27
+  operations: 380
+
+# Tier 1 is serviced before anything else on a multi-intent turn. Domains
+# without a tier fall to 'all_other_service_intents'.
+priority_order:
+  - {tier: 1, name: emergency_security}
+  - {tier: 2, name: fraud_security}
+  - {tier: 3, name: card_lifecycle.lost_or_stolen}
+  - {tier: 4, name: hardship_collections}
+  - {tier: 5, name: bereavement_legal}
+  - {tier: 6, name: complaints_grievances}
+  - {tier: 7, name: all_other_service_intents}
+  - {tier: 8, name: conversational_meta}
+
+domains:
+  conversational_meta:
+    description: "Social, navigation and bot-control requests."
+    state_profile: ST-CONVERSATION
+    flow: FL-CONVERSATION
+    default_mode: conversational
+    operations:
+      - {name: greet, read_only: true }
+      - {name: thank, read_only: true }
+      - {name: goodbye, read_only: true }
+      - {name: small_talk, read_only: true }
+      - {name: ask_capabilities, read_only: true }
+      - {name: ask_how_it_works, read_only: true }
+      - {name: help, read_only: true }
+      - {name: repeat_or_rephrase, read_only: true }
+      - {name: request_human, read_only: false}
+      - {name: give_feedback, read_only: false}
+      - {name: complain_about_bot, read_only: false}
+      - {name: change_language, read_only: false}
+      - {name: accessibility_request, read_only: false}
+      - {name: cancel_current_request, read_only: false}
+      - {name: restart_current_request, read_only: false}
+      - {name: check_request_status, read_only: true }
+
+  general_information:
+    description: "Non-account-specific Amex India information."
+    state_profile: ST-PUBLIC-INFO
+    flow: FL-PUBLIC-INFO
+    default_mode: informational
+    operations:
+      - {name: card_products_available, read_only: true }
+      - {name: compare_card_products, read_only: true }
+      - {name: general_eligibility, read_only: true }
+      - {name: published_fees_and_rates, read_only: true }
+      - {name: card_acceptance, read_only: true }
+      - {name: contact_channels, read_only: true }
+      - {name: customer_care_hours, read_only: true }
+      - {name: branch_or_postal_address, read_only: true }
+      - {name: app_download, read_only: true }
+      - {name: security_education, read_only: true }
+      - {name: privacy_information, read_only: true }
+      - {name: terms_and_conditions, read_only: true }
+      - {name: domestic_cash_withdrawal_availability, read_only: true }
+      - {name: general_foreign_exchange_information, read_only: true }
+
+  online_access:
+    description: "Online Services and Amex App registration, login, passwords and OTP delivery. NOT card PIN."
+    state_profile: ST-ACCESS
+    flow: FL-ACCESS
+    default_mode: secure_self_service
+    operations:
+      - {name: register_online_services, read_only: false}
+      - {name: add_card_to_online_account, read_only: false}
+      - {name: remove_card_from_online_account, read_only: false}
+      - {name: login_problem, read_only: false}
+      - {name: forgot_user_id, read_only: false}
+      - {name: forgot_password, read_only: false}
+      - {name: locked_online_account, read_only: false}
+      - {name: change_password, read_only: false}
+      - {name: app_problem, read_only: false}
+      - {name: website_problem, read_only: false}
+      - {name: device_change, read_only: false}
+      - {name: otp_not_received, read_only: false}
+      - {name: otp_expired, read_only: false}
+      - {name: unexpected_otp_or_security_code, read_only: false}
+      - {name: logout_or_end_secure_session, read_only: false}
+
+  profile_preferences:
+    description: "Contact details, identity profile and communication preferences."
+    state_profile: ST-PROFILE
+    flow: FL-PROFILE
+    default_mode: mixed
+    operations:
+      - {name: view_contact_details, read_only: true }
+      - {name: update_email, read_only: false}
+      - {name: update_mobile, read_only: false}
+      - {name: update_address, read_only: false}
+      - {name: update_name, read_only: false}
+      - {name: update_date_of_birth, read_only: false}
+      - {name: marketing_opt_in, read_only: false}
+      - {name: marketing_opt_out, read_only: false}
+      - {name: privacy_choice, read_only: false}
+      - {name: alert_preferences, read_only: false}
+      - {name: statement_delivery_preferences, read_only: false}
+      - {name: switch_off_paper_statements, read_only: false}
+      - {name: preferred_language, read_only: false}
+
+  card_lifecycle_controls:
+    description: "Card activation, card PIN, blocking/freezing, replacement, renewal and closure."
+    state_profile: ST-CARD-CONTROL
+    flow: FL-CARD-CONTROL
+    default_mode: consequential
+    operations:
+      - {name: activate_new_card, read_only: false}
+      - {name: activate_renewal_card, read_only: false}
+      - {name: activate_replacement_card, read_only: false}
+      - {name: view_pin, read_only: true }
+      - {name: change_pin, read_only: false}
+      - {name: forgot_pin, read_only: false}
+      - {name: pin_locked, read_only: false}
+      - {name: temporarily_block_card, read_only: false}
+      - {name: unblock_card, read_only: false}
+      - {name: temporary_block_status, read_only: true }
+      - {name: report_lost_card, read_only: false}
+      - {name: report_stolen_card, read_only: false}
+      - {name: replace_damaged_card, read_only: false}
+      - {name: replace_not_received_card, read_only: false}
+      - {name: replace_compromised_card, read_only: false}
+      - {name: replacement_status, read_only: true }
+      - {name: renewal_status, read_only: true }
+      - {name: card_expiring, read_only: false}
+      - {name: close_card_account, read_only: false}
+      - {name: card_closure_status, read_only: true }
+      - {name: destroy_or_return_old_card, read_only: false}
+
+  supplementary_cards:
+    description: "Additional/Supplementary Card servicing and permissions."
+    state_profile: ST-SUPPLEMENTARY
+    flow: FL-SUPPLEMENTARY
+    default_mode: mixed
+    operations:
+      - {name: apply_for_supplementary_card, read_only: false}
+      - {name: supplementary_card_status, read_only: true }
+      - {name: activate_supplementary_card, read_only: false}
+      - {name: supplementary_view_or_change_pin, read_only: false}
+      - {name: temporarily_block_supplementary_card, read_only: false}
+      - {name: unblock_supplementary_card, read_only: false}
+      - {name: replace_supplementary_card, read_only: false}
+      - {name: cancel_supplementary_card, read_only: false}
+      - {name: view_supplementary_spend, read_only: true }
+      - {name: set_or_change_supplementary_spend_control, read_only: false}
+      - {name: supplementary_permissions, read_only: true }
+      - {name: supplementary_liability, read_only: true }
+      - {name: supplementary_rewards_permissions, read_only: true }
+      - {name: supplementary_offer_eligibility, read_only: true }
+
+  transaction_activity:
+    description: "Explain, locate or troubleshoot transaction activity."
+    state_profile: ST-TRANSACTION
+    flow: FL-TRANSACTION
+    default_mode: mixed
+    operations:
+      - {name: view_recent_transactions, read_only: true }
+      - {name: view_pending_transactions, read_only: true }
+      - {name: view_unbilled_transactions, read_only: true }
+      - {name: identify_merchant_name, read_only: true }
+      - {name: transaction_declined, read_only: false}
+      - {name: transaction_pending_too_long, read_only: false}
+      - {name: transaction_reversed_or_voided, read_only: false}
+      - {name: duplicate_transaction, read_only: false}
+      - {name: incorrect_transaction_amount, read_only: false}
+      - {name: incorrect_currency_conversion, read_only: false}
+      - {name: cash_withdrawal_query, read_only: true }
+      - {name: contactless_problem, read_only: false}
+      - {name: chip_and_pin_problem, read_only: false}
+      - {name: online_transaction_problem, read_only: false}
+      - {name: safekey_problem, read_only: false}
+      - {name: international_transaction_problem, read_only: false}
+      - {name: transaction_alert_query, read_only: true }
+      - {name: transaction_receipt_or_copy, read_only: false}
+
+  fraud_security:
+    description: "Suspected fraud, compromise, scams and account takeover."
+    state_profile: ST-FRAUD
+    flow: FL-FRAUD
+    default_mode: emergency
+    priority_tier: 2
+    operations:
+      - {name: unrecognized_transaction, read_only: false}
+      - {name: confirmed_fraudulent_transaction, read_only: false}
+      - {name: card_present_but_fraud_seen, read_only: false}
+      - {name: card_lost_with_possible_fraud, read_only: false}
+      - {name: card_stolen_with_possible_fraud, read_only: false}
+      - {name: identity_theft, read_only: false}
+      - {name: account_takeover, read_only: false}
+      - {name: phishing_email_or_message, read_only: false}
+      - {name: scam_or_digital_arrest, read_only: false}
+      - {name: unexpected_otp_or_alert, read_only: false}
+      - {name: credentials_or_card_details_shared, read_only: false}
+      - {name: suspicious_call_claiming_to_be_amex, read_only: false}
+      - {name: merchant_or_data_breach, read_only: false}
+      - {name: emergency_block_and_fraud_review, read_only: false}
+
+  disputes:
+    description: "Transaction or fee dispute creation and case servicing."
+    state_profile: ST-DISPUTE
+    flow: FL-DISPUTE
+    default_mode: regulated_case
+    operations:
+      - {name: initiate_merchant_dispute, read_only: false}
+      - {name: initiate_fraud_dispute, read_only: false}
+      - {name: dispute_fee_or_interest, read_only: false}
+      - {name: dispute_payment, read_only: false}
+      - {name: dispute_credit_not_received, read_only: false}
+      - {name: dispute_duplicate_charge, read_only: false}
+      - {name: dispute_goods_or_services, read_only: false}
+      - {name: dispute_cash_withdrawal, read_only: false}
+      - {name: check_dispute_eligibility, read_only: true }
+      - {name: check_dispute_status, read_only: true }
+      - {name: submit_dispute_documents, read_only: false}
+      - {name: acknowledge_dispute, read_only: false}
+      - {name: cancel_or_withdraw_dispute, read_only: false}
+      - {name: challenge_dispute_outcome, read_only: false}
+      - {name: payment_treatment_during_dispute, read_only: false}
+      - {name: dispute_timeline, read_only: true }
+
+  payments_autopay:
+    description: "Bill payment, payment tracing, Autopay and credit-balance refund."
+    state_profile: ST-PAYMENT
+    flow: FL-PAYMENT
+    default_mode: mixed
+    operations:
+      - {name: view_amount_due, read_only: true }
+      - {name: view_payment_due_date, read_only: true }
+      - {name: explain_minimum_amount_due, read_only: true }
+      - {name: explain_total_amount_due, read_only: true }
+      - {name: payment_methods, read_only: true }
+      - {name: make_payment, read_only: false}
+      - {name: payment_status, read_only: true }
+      - {name: payment_not_reflected, read_only: false}
+      - {name: payment_made_to_wrong_card, read_only: false}
+      - {name: duplicate_payment, read_only: false}
+      - {name: returned_or_bounced_payment, read_only: false}
+      - {name: late_payment, read_only: true }
+      - {name: payment_allocation, read_only: true }
+      - {name: payment_from_third_party_account, read_only: true }
+      - {name: nonresident_payment, read_only: true }
+      - {name: enroll_autopay, read_only: false}
+      - {name: change_autopay_amount, read_only: false}
+      - {name: change_autopay_bank, read_only: false}
+      - {name: check_autopay_status, read_only: true }
+      - {name: cancel_autopay_or_direct_debit, read_only: false}
+      - {name: autopay_failed, read_only: false}
+      - {name: credit_balance_or_overpayment, read_only: false}
+      - {name: request_credit_balance_refund, read_only: false}
+      - {name: credit_balance_refund_status, read_only: true }
+
+  statements_balances:
+    description: "Statements, account balances and billing explanations."
+    state_profile: ST-STATEMENT
+    flow: FL-STATEMENT
+    default_mode: read_or_inform
+    operations:
+      - {name: view_current_balance, read_only: true }
+      - {name: view_available_credit, read_only: true }
+      - {name: view_credit_limit, read_only: true }
+      - {name: view_statement, read_only: true }
+      - {name: download_statement, read_only: true }
+      - {name: request_statement_reprint, read_only: true }
+      - {name: statement_not_received, read_only: true }
+      - {name: paperless_statement, read_only: true }
+      - {name: cancelled_account_statement, read_only: true }
+      - {name: statement_error_or_omission, read_only: true }
+      - {name: explain_statement_line, read_only: true }
+      - {name: explain_opening_or_closing_balance, read_only: true }
+      - {name: explain_unbilled_amount, read_only: true }
+      - {name: explain_interest_line, read_only: true }
+      - {name: explain_tax_line, read_only: true }
+      - {name: explain_fee_line, read_only: true }
+      - {name: explain_emi_summary, read_only: true }
+
+  fees_interest:
+    description: "Published fees, interest, and requests to correct or waive them."
+    state_profile: ST-FEE
+    flow: FL-FEE
+    default_mode: financial_adjustment
+    operations:
+      - {name: annual_fee_information, read_only: true }
+      - {name: late_payment_fee_information, read_only: true }
+      - {name: returned_payment_fee_information, read_only: true }
+      - {name: foreign_currency_fee_information, read_only: true }
+      - {name: cash_withdrawal_fee_information, read_only: true }
+      - {name: emi_fee_information, read_only: true }
+      - {name: interest_rate_information, read_only: true }
+      - {name: interest_calculation, read_only: true }
+      - {name: fee_or_interest_not_understood, read_only: true }
+      - {name: fee_or_interest_incorrect, read_only: false}
+      - {name: request_fee_waiver, read_only: false}
+      - {name: request_fee_reversal, read_only: false}
+      - {name: request_interest_adjustment, read_only: false}
+      - {name: renewal_fee_waiver_eligibility, read_only: true }
+      - {name: tax_on_fee_or_interest, read_only: true }
+
+  credit_spending_power:
+    description: "Credit limit, spending power and credit reporting."
+    state_profile: ST-CREDIT
+    flow: FL-CREDIT
+    default_mode: credit_decision
+    operations:
+      - {name: view_credit_limit, read_only: true }
+      - {name: view_available_credit, read_only: true }
+      - {name: permanent_credit_limit_increase, read_only: false}
+      - {name: permanent_credit_limit_decrease, read_only: false}
+      - {name: temporary_credit_limit_request, read_only: false}
+      - {name: spending_power_check, read_only: false}
+      - {name: over_limit_query, read_only: true }
+      - {name: credit_limit_change_status, read_only: true }
+      - {name: declined_limit_request, read_only: false}
+      - {name: submit_income_documents, read_only: false}
+      - {name: credit_bureau_or_cic_reporting, read_only: true }
+      - {name: nesl_reporting, read_only: true }
+      - {name: correct_credit_report, read_only: false}
+      - {name: credit_report_complaint, read_only: false}
+
+  payflex_emi:
+    description: "Amex India PAYFLEX/EMI instalment servicing."
+    state_profile: ST-EMI
+    flow: FL-EMI
+    default_mode: financial_contract
+    operations:
+      - {name: emi_information, read_only: true }
+      - {name: emi_eligibility, read_only: true }
+      - {name: emi_calculation, read_only: true }
+      - {name: convert_transaction_to_emi, read_only: false}
+      - {name: convert_statement_balance_to_emi, read_only: false}
+      - {name: point_of_sale_emi, read_only: false}
+      - {name: emi_conversion_status, read_only: true }
+      - {name: emi_payment_or_schedule, read_only: false}
+      - {name: emi_interest_or_fee, read_only: false}
+      - {name: emi_credit_limit_effect, read_only: true }
+      - {name: change_emi_tenure, read_only: false}
+      - {name: cancel_emi_before_first_due_date, read_only: false}
+      - {name: foreclose_emi, read_only: false}
+      - {name: refund_on_emi_transaction, read_only: false}
+      - {name: emi_on_card_closure, read_only: false}
+      - {name: disputed_emi_transaction, read_only: false}
+
+  membership_rewards:
+    description: "Membership Rewards enrolment, earning, redemption and transfer."
+    state_profile: ST-REWARDS
+    flow: FL-REWARDS
+    default_mode: mixed
+    operations:
+      - {name: rewards_program_information, read_only: true }
+      - {name: enroll_membership_rewards, read_only: false}
+      - {name: view_points_balance, read_only: true }
+      - {name: points_earning_calculation, read_only: true }
+      - {name: missing_points, read_only: false}
+      - {name: points_expiry, read_only: true }
+      - {name: redeem_points, read_only: false}
+      - {name: redeem_for_statement_credit, read_only: false}
+      - {name: redeem_for_voucher_or_item, read_only: false}
+      - {name: transfer_points_to_partner, read_only: false}
+      - {name: transfer_to_another_person, read_only: false}
+      - {name: supplementary_redemption_permission, read_only: true }
+      - {name: insufficient_points, read_only: true }
+      - {name: redemption_status, read_only: true }
+      - {name: cancel_redemption, read_only: false}
+      - {name: reward_not_received, read_only: false}
+      - {name: points_after_card_closure, read_only: false}
+
+  amex_offers:
+    description: "Amex Offers enrolment, eligibility and missing incentives."
+    state_profile: ST-OFFER
+    flow: FL-OFFER
+    default_mode: mixed
+    operations:
+      - {name: view_available_offers, read_only: true }
+      - {name: save_offer_to_card, read_only: false}
+      - {name: view_saved_offers, read_only: true }
+      - {name: offer_eligibility, read_only: true }
+      - {name: supplementary_offer, read_only: false}
+      - {name: missing_offer_credit_or_points, read_only: false}
+      - {name: offer_used_before_saving, read_only: false}
+      - {name: offer_used_on_wrong_card, read_only: false}
+      - {name: third_party_processor_offer, read_only: false}
+      - {name: wallet_offer_eligibility, read_only: true }
+      - {name: refunded_offer_purchase, read_only: false}
+      - {name: replaced_card_offer, read_only: false}
+      - {name: cancelled_card_offer, read_only: false}
+      - {name: offer_enrollment_cap, read_only: false}
+      - {name: offer_terms_or_expiry, read_only: true }
+
+  benefits_protections:
+    description: "Product benefits, insurance, protection and claims."
+    state_profile: ST-BENEFIT
+    flow: FL-BENEFIT
+    default_mode: mixed
+    operations:
+      - {name: benefit_eligibility, read_only: true }
+      - {name: benefit_terms, read_only: true }
+      - {name: lounge_access, read_only: true }
+      - {name: dining_benefit, read_only: true }
+      - {name: hotel_benefit, read_only: true }
+      - {name: concierge, read_only: true }
+      - {name: purchase_protection, read_only: true }
+      - {name: travel_insurance, read_only: true }
+      - {name: other_card_insurance, read_only: true }
+      - {name: enroll_benefit, read_only: false}
+      - {name: missing_benefit, read_only: false}
+      - {name: make_insurance_claim, read_only: false}
+      - {name: insurance_claim_status, read_only: true }
+      - {name: insurance_complaint, read_only: false}
+
+  travel:
+    description: "Card use abroad and American Express Travel servicing."
+    state_profile: ST-TRAVEL
+    flow: FL-TRAVEL
+    default_mode: mixed
+    operations:
+      - {name: use_card_abroad, read_only: true }
+      - {name: international_acceptance, read_only: true }
+      - {name: foreign_exchange_or_conversion, read_only: true }
+      - {name: overseas_cash_withdrawal, read_only: true }
+      - {name: emergency_card_replacement_abroad, read_only: false}
+      - {name: global_assist, read_only: false}
+      - {name: make_travel_booking, read_only: false}
+      - {name: change_travel_booking, read_only: false}
+      - {name: cancel_travel_booking, read_only: false}
+      - {name: travel_booking_refund, read_only: false}
+      - {name: travel_booking_status, read_only: true }
+      - {name: traveler_cheques, read_only: true }
+      - {name: lounge_during_travel, read_only: true }
+
+  applications_product_changes:
+    description: "New applications, application status and product changes."
+    state_profile: ST-APPLICATION
+    flow: FL-APPLICATION
+    default_mode: sales_or_underwriting
+    operations:
+      - {name: apply_for_card, read_only: false}
+      - {name: application_eligibility, read_only: true }
+      - {name: application_status, read_only: true }
+      - {name: application_documents, read_only: false}
+      - {name: application_declined, read_only: false}
+      - {name: reconsideration_or_appeal, read_only: false}
+      - {name: card_delivery_status, read_only: true }
+      - {name: welcome_bonus, read_only: false}
+      - {name: referral, read_only: false}
+      - {name: upgrade_card, read_only: false}
+      - {name: downgrade_card, read_only: false}
+      - {name: product_change, read_only: false}
+      - {name: retention_or_cancel_due_to_fee, read_only: false}
+
+  kyc_compliance:
+    description: "KYC refresh, identity documentation and compliance restrictions."
+    state_profile: ST-KYC
+    flow: FL-KYC
+    default_mode: regulated_case
+    operations:
+      - {name: kyc_information, read_only: true }
+      - {name: periodic_kyc_due, read_only: false}
+      - {name: update_kyc, read_only: false}
+      - {name: kyc_documents, read_only: true }
+      - {name: video_kyc, read_only: false}
+      - {name: kyc_status, read_only: true }
+      - {name: kyc_rejected, read_only: false}
+      - {name: card_blocked_for_kyc, read_only: false}
+      - {name: pan_or_form60, read_only: false}
+      - {name: masked_aadhaar_guidance, read_only: true }
+      - {name: overseas_or_fema_compliance, read_only: false}
+      - {name: regulatory_notice_query, read_only: true }
+
+  hardship_collections:
+    description: "Inability to pay, delinquency, vulnerability and collections."
+    state_profile: ST-HARDSHIP
+    flow: FL-HARDSHIP
+    default_mode: vulnerable_customer_handoff
+    priority_tier: 4
+    operations:
+      - {name: cannot_pay, read_only: false}
+      - {name: job_loss, read_only: false}
+      - {name: illness_or_disability, read_only: false}
+      - {name: natural_disaster_or_emergency, read_only: false}
+      - {name: reduced_income, read_only: false}
+      - {name: payment_arrangement, read_only: false}
+      - {name: delinquent_account, read_only: false}
+      - {name: collection_contact, read_only: false}
+      - {name: collection_agent_complaint, read_only: false}
+      - {name: request_credit_counselling, read_only: false}
+      - {name: vulnerable_customer_support, read_only: false}
+
+  complaints_grievances:
+    description: "Formal complaint intake, tracking and escalation."
+    state_profile: ST-COMPLAINT
+    flow: FL-COMPLAINT
+    default_mode: regulated_case
+    priority_tier: 6
+    operations:
+      - {name: make_complaint, read_only: false}
+      - {name: complaint_status, read_only: true }
+      - {name: dissatisfied_with_resolution, read_only: false}
+      - {name: escalate_to_manager, read_only: false}
+      - {name: escalate_to_head_customer_service, read_only: false}
+      - {name: escalate_to_nodal_officer, read_only: false}
+      - {name: escalate_to_principal_nodal_officer, read_only: false}
+      - {name: unresolved_after_30_days, read_only: false}
+      - {name: rbi_ombudsman_information, read_only: true }
+      - {name: misselling_complaint, read_only: false}
+      - {name: harassment_complaint, read_only: false}
+      - {name: insurance_grievance, read_only: false}
+      - {name: credit_information_delay_compensation, read_only: false}
+
+  bereavement_legal:
+    description: "Death notification, estate or legal representative, legal restriction."
+    state_profile: ST-BEREAVEMENT
+    flow: FL-BEREAVEMENT
+    default_mode: specialist_handoff
+    priority_tier: 5
+    operations:
+      - {name: notify_cardmember_death, read_only: false}
+      - {name: deceased_account_information, read_only: true }
+      - {name: estate_or_legal_representative, read_only: false}
+      - {name: deceased_balance_or_refund, read_only: false}
+      - {name: deceased_rewards, read_only: false}
+      - {name: submit_deceased_documents, read_only: false}
+      - {name: legal_order_or_incapacity, read_only: false}
+
+  corporate_card:
+    description: "Corporate Cardmember, Program Administrator and company servicing."
+    state_profile: ST-CORPORATE
+    flow: FL-CORPORATE
+    default_mode: specialist_or_pa
+    operations:
+      - {name: corporate_card_general, read_only: false}
+      - {name: contact_program_administrator, read_only: false}
+      - {name: corporate_card_activation, read_only: false}
+      - {name: corporate_card_replacement, read_only: false}
+      - {name: corporate_payment, read_only: false}
+      - {name: corporate_autopay, read_only: false}
+      - {name: company_or_individual_liability, read_only: true }
+      - {name: corporate_credit_balance_refund, read_only: false}
+      - {name: company_cancelled_card, read_only: false}
+      - {name: corporate_cash_overseas, read_only: false}
+      - {name: corporate_expense_or_statement, read_only: false}
+      - {name: corporate_kyc, read_only: false}
+      - {name: corporate_program_change, read_only: false}
+
+  merchant_acceptance:
+    description: "Card acceptance and merchant-side issues."
+    state_profile: ST-MERCHANT
+    flow: FL-MERCHANT
+    default_mode: inform_or_specialist
+    operations:
+      - {name: where_card_is_accepted, read_only: true }
+      - {name: merchant_refuses_card, read_only: false}
+      - {name: merchant_surcharge, read_only: true }
+      - {name: terminal_or_acceptance_problem, read_only: false}
+      - {name: merchant_refund_not_received, read_only: false}
+      - {name: become_amex_merchant, read_only: false}
+      - {name: merchant_account_support, read_only: false}
+
+  emergency_security:
+    description: "Immediate physical safety, coercion or security emergency."
+    state_profile: ST-EMERGENCY
+    flow: FL-EMERGENCY
+    default_mode: emergency
+    priority_tier: 1
+    operations:
+      - {name: under_duress_or_coercion, read_only: false}
+      - {name: active_scam_or_digital_arrest, read_only: false}
+      - {name: financial_abuse, read_only: false}
+      - {name: immediate_account_takeover, read_only: false}
+      - {name: device_or_card_currently_with_attacker, read_only: false}
+      - {name: physical_safety_risk, read_only: false}
+
+  fallback:
+    description: "Catch-all: out of domain, abuse, injection, unintelligible, unmapped."
+    state_profile: ST-FALLBACK
+    flow: FL-FALLBACK
+    default_mode: safe_fallback
+    operations:
+      - {name: unsupported_market, read_only: true }
+      - {name: unsupported_product, read_only: true }
+      - {name: out_of_domain, read_only: true }
+      - {name: unrelated_small_talk, read_only: true }
+      - {name: unintelligible_or_gibberish, read_only: true }
+      - {name: unsupported_language, read_only: true }
+      - {name: abusive_or_hateful, read_only: true }
+      - {name: prompt_injection, read_only: true }
+      - {name: request_for_secrets_or_internal_data, read_only: true }
+      - {name: impersonation_or_third_party_social_engineering, read_only: true }
+      - {name: impossible_or_illegal_action, read_only: true }
+      - {name: unmapped_service_request, read_only: true }
+
+enums:
+  dialogue_acts:
+    - greeting
+    - thanks
+    - goodbye
+    - affirm
+    - deny
+    - choose_option
+    - provide_requested_value
+    - correct_prior_value
+    - ask_repeat
+    - ask_explanation
+    - go_back
+    - cancel_current
+    - pause
+    - resume
+    - restart
+    - switch_topic
+    - add_second_request
+    - request_status
+    - request_human
+    - express_dissatisfaction
+    - refuse_authentication
+    - refuse_confirmation
+    - cannot_provide
+    - unclear
+
+  modifiers:
+    - urgent
+    - fraud_suspected
+    - card_lost
+    - card_stolen
+    - identity_theft
+    - account_takeover
+    - unexpected_otp
+    - member_under_duress
+    - financial_hardship
+    - vulnerable_customer
+    - bereavement
+    - travelling_now
+    - cash_emergency
+    - legal_threat
+    - complaint
+    - repeated_request
+    - member_confused
+    - accessibility_need
+    - preferred_language_changed
+    - multiple_cards_possible
+    - supplementary_card
+    - corporate_card
+    - charge_card
+    - credit_card
+    - third_party_requestor
+    - pii_or_secret_present
+    - abusive_language
+    - prompt_injection
+
+  session_status:
+    - open
+    - idle
+    - closed
+    - security_terminated
+
+  flow_status:
+    - classified
+    - clarifying_intent
+    - collecting_slots
+    - awaiting_authentication
+    - awaiting_step_up
+    - evaluating_policy
+    - awaiting_confirmation
+    - executing
+    - verifying_effect
+    - completed
+    - declined
+    - cancelled
+    - handed_off
+    - expired
+    - failed_safe
+
+  slot_status:
+    - unknown
+    - inferred_unverified
+    - customer_provided
+    - system_fetched
+    - verified
+    - invalid
+    - conflicting
+    - not_applicable
+
+  action_status:
+    - not_started
+    - proposed
+    - confirmed
+    - submitted
+    - succeeded
+    - failed
+    - indeterminate
+    - compensated
+
+  decision_outcomes:
+    - allow
+    - deny
+    - needs_input
+    - step_up
+    - handoff
+    - inform
+    - refuse
+
+  response_templates:
+    - T-GREETING
+    - T-CAPABILITIES
+    - T-GOODBYE
+    - T-SECRET-REDACTED
+    - T-AUTH-REQUIRED
+    - T-AUTH-FAILED
+    - T-AUTH-LOCKED
+    - T-INTENT-CLARIFY
+    - T-INTENT-UNRESOLVED
+    - T-MULTI-INTENT
+    - T-TOPIC-SWITCH
+    - T-SELECT-CARD
+    - T-SELECT-ITEM
+    - T-SLOT-INVALID-1
+    - T-SLOT-INVALID-2
+    - T-SLOT-INVALID-3
+    - T-LOOP-STOP
+    - T-CONFIRM
+    - T-CONFIRM-UNCLEAR
+    - T-CANCELLED
+    - T-EXECUTING
+    - T-SUCCESS
+    - T-INDETERMINATE
+    - T-HANDOFF
+    - T-OOD
+    - T-UNMAPPED
+    - T-PROMPT-INJECTION
+    - T-ABUSE-BOUNDARY
+    - T-HARDSHIP
+    - T-FRAUD-URGENT
+
+# Terminal flow states — a flow in one of these is closed and cannot resume.
+terminal_flow_status: [completed, declined, cancelled, handed_off, expired, failed_safe]
+
+# Deterministic pre-classification gate. These route BEFORE the intent
+# classifier runs, so the highest-priority operations can never be swallowed
+# by a lower-priority label (03_*.yaml ordered_transition_engine order 2).
+emergency_modifiers:
+  under_duress_or_coercion:
+    domain: emergency_security
+    operation: under_duress_or_coercion
+    phrases: [being forced, forcing me, someone is making me, held against,
+      under duress, threatening me, they are watching, gun to my head,
+      digital arrest, not safe to talk]
+  active_scam_or_digital_arrest:
+    domain: emergency_security
+    operation: active_scam_or_digital_arrest
+    phrases: [digital arrest, scam call, scammer, fake police, cbi called,
+      customs called, they said my account is involved]
+  notify_cardmember_death:
+    domain: bereavement_legal
+    operation: notify_cardmember_death
+    phrases: [passed away, has died, deceased, my late father, my late mother,
+      my late husband, my late wife, bereavement, funeral]
+  card_stolen_with_possible_fraud:
+    domain: fraud_security
+    operation: card_stolen_with_possible_fraud
+    phrases: [card was stolen, someone stole my card, stolen card]
+  unrecognized_transaction:
+    domain: fraud_security
+    operation: unrecognized_transaction
+    phrases: [i never made, didn't make this, did not make this, never authorised,
+      never authorized, purchase i never, charge i never, don't recognise this charge,
+      dont recognize this charge, unauthorised transaction, unauthorized transaction]
+  account_takeover:
+    domain: fraud_security
+    operation: account_takeover
+    phrases: [someone has access to my account, locked out of my account,
+      my details were changed, account takeover]
+  cannot_pay:
+    domain: hardship_collections
+    operation: cannot_pay
+    phrases: [can't pay, cannot pay, lost my job, job loss, laid off, struggling,
+      hardship, financial difficulty, unemployed, can't afford, cannot afford,
+      behind on, medical bills, no income]

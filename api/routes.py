@@ -165,6 +165,18 @@ def agent_message(req: AgentRequest) -> AgentResponse:
 
     _audit_turn(req, result, trace_id)
 
+    # A turn that is not waiting on the member has reached a terminal state, so
+    # the slot-collecting flow is closed: restricted slots are purged, the
+    # summary is kept, and attempt counters reset. Without this the next
+    # unrelated 'clarify' message would be pulled back into the finished flow.
+    if not result.get("awaiting_member"):
+        records = result.get("decision_records") or []
+        sessions.terminalize(
+            req.session_id,
+            records[-1].outcome.value if records else
+            ("ESCALATED" if result.get("escalate") else "CLOSED"),
+        )
+
     return AgentResponse(
         reply=result.get("reply", ""),
         actions_taken=result.get("actions_taken", []),

@@ -21,6 +21,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Optional
 
+from agent import catalogue
 from agent.llm import LLMUnavailable, llm
 from shared.config import config
 from shared.schemas import Intent
@@ -189,7 +190,172 @@ def classify(message: str) -> Intent:
     if intent.label != "hardship" and intent.confidence < config.CONFIDENCE_THRESHOLD:
         return Intent(label="clarify", confidence=intent.confidence,
                       rationale=intent.rationale)
-    return intent
+    # Carry the canonical operation so callers of the legacy entry point route
+    # through the same catalogue as classify_operation().
+    return intent.model_copy(update={"operation": LABEL_TO_OPERATION.get(intent.label)})
+
+
+# --------------------------------------------------------------------------- #
+# Catalogue classification — all 380 operations
+# --------------------------------------------------------------------------- #
+# The eight legacy labels that have a built policy or tool, and the catalogue
+# operation each one IS. Derivation runs operation -> label, never the reverse:
+# the catalogue is the source of truth and this map is only the built subset.
+OPERATION_TO_LABEL: dict[str, str] = {
+    "fees_interest.request_fee_waiver": "fee_waiver",
+    "fees_interest.request_fee_reversal": "fee_waiver",
+    "credit_spending_power.permanent_credit_limit_increase": "credit_limit_increase",
+    "card_lifecycle_controls.replace_damaged_card": "card_replacement",
+    "card_lifecycle_controls.report_lost_card": "card_replacement",
+    "card_lifecycle_controls.replace_not_received_card": "card_replacement",
+    "card_lifecycle_controls.temporarily_block_card": "card_block",
+    "card_lifecycle_controls.change_pin": "reset_pin",
+    "transaction_activity.identify_merchant_name": "explain_charge",
+    "statements_balances.view_current_balance": "account_info",
+    "profile_preferences.update_address": "update_address",
+    "hardship_collections.cannot_pay": "hardship",
+    "hardship_collections.job_loss": "hardship",
+}
+LABEL_TO_OPERATION: dict[str, str] = {
+    "fee_waiver": "fees_interest.request_fee_waiver",
+    "credit_limit_increase": "credit_spending_power.permanent_credit_limit_increase",
+    "card_replacement": "card_lifecycle_controls.replace_damaged_card",
+    "card_block": "card_lifecycle_controls.temporarily_block_card",
+    "explain_charge": "transaction_activity.identify_merchant_name",
+    "account_info": "statements_balances.view_current_balance",
+    "reset_pin": "card_lifecycle_controls.change_pin",
+    "update_address": "profile_preferences.update_address",
+    "hardship": "hardship_collections.cannot_pay",
+    "dispute_transaction": "disputes.initiate_merchant_dispute",
+    "payment_issue": "payments_autopay.autopay_failed",
+    "profile_update": "profile_preferences.update_email",
+}
+
+UNMAPPED = "unmapped"
+
+_DOMAIN_SYSTEM = (
+    "You route American Express India card-servicing messages to exactly one "
+    "service domain from a fixed list. You never invent a domain name. If the "
+    "message is not an Amex servicing request at all, answer 'fallback'."
+)
+_OP_SYSTEM = (
+    "You select the single operation within a known service domain that best "
+    "matches the member's message. You choose only from the list given. If none "
+    "of them fits, return null and a low confidence rather than the closest guess.\n"
+    "Prefer the plain, unqualified operation. Only choose a qualified variant — "
+    "one naming temporary, supplementary, corporate, statement, or point_of_sale "
+    "— when the member actually used that qualifier. 'Increase my limit' is the "
+    "permanent operation, not the temporary one."
+)
+
+
+def label_for(operation_id: Optional[str]) -> str:
+    """The short label for a catalogue operation, or 'unmapped'."""
+    if not operation_id:
+        return "clarify"
+    return OPERATION_TO_LABEL.get(operation_id, UNMAPPED)
+
+
+def _llm_classify_operation(message: str) -> Optional[tuple[str, float, str]]:
+    """Two-stage LLM selection: domain first, then operation inside it.
+
+    Two calls rather than one over all 380: a 380-item prompt both costs more
+    and classifies worse than 27 then <=24. The domain step is also the one
+    worth getting right — it determines the state profile and the flow, so a
+    wrong domain is a wrong policy, while a wrong operation inside the right
+    domain still fails closed to the same handoff.
+    """
+    doms = catalogue.domains()
+    # The description is what disambiguates the neighbouring domains — without
+    # it "change my PIN" lands in online_access (passwords) instead of
+    # card_lifecycle_controls (card PIN), and the built flow becomes unreachable.
+    listing = "\n".join(f"- {name}: {body['description']}" for name, body in doms.items())
+    try:
+        picked = llm.structured_json(
+            _DOMAIN_SYSTEM,
+            f"Message: {message!r}\n\nDomains:\n{listing}",
+            '{"domain": "<one domain name>", "confidence": <0.0-1.0>}',
+        )
+        domain = str(picked.get("domain", "")).strip()
+        d_conf = float(picked.get("confidence", 0.0))
+    except (LLMUnavailable, ValueError, KeyError, TypeError):
+        return None
+    if domain not in doms:
+        return None
+
+    ops = catalogue.operations_in(domain)
+    try:
+        chosen = llm.structured_json(
+            _OP_SYSTEM,
+            f"Message: {message!r}\n\nDomain: {domain}\nOperations:\n"
+            + "\n".join(f"- {o}" for o in ops),
+            '{"operation": "<one operation name or null>", "confidence": <0.0-1.0>,'
+            ' "rationale": "<short>"}',
+        )
+        operation = chosen.get("operation")
+        o_conf = float(chosen.get("confidence", 0.0))
+        rationale = str(chosen.get("rationale") or "")
+    except (LLMUnavailable, ValueError, KeyError, TypeError):
+        return None
+    if not operation or operation not in ops:
+        return None
+
+    # Joint confidence: the operation is only as certain as the domain it sits in.
+    return f"{domain}.{operation}", round(d_conf * o_conf, 4), rationale
+
+
+def _offline_classify_operation(message: str) -> Optional[tuple[str, float, str]]:
+    """No-LLM path: the trained/keyword label first, lexical catalogue search after.
+
+    The legacy classifier is preferred where it fires because it was actually
+    fitted to member phrasings; lexical overlap on machine-readable operation
+    ids is a weak signal and scores itself accordingly (max 0.6, below the
+    act threshold), so it clarifies rather than acting.
+    """
+    legacy = _offline_classify(message)
+    if legacy.label != "clarify" and legacy.label in LABEL_TO_OPERATION:
+        return LABEL_TO_OPERATION[legacy.label], legacy.confidence, legacy.rationale or ""
+    ranked = catalogue.score_lexical(message, top_k=2)
+    if not ranked:
+        return None
+    op_id, score = ranked[0]
+    # Require separation from the runner-up, same margin rule as the intent gate.
+    if len(ranked) > 1 and (score - ranked[1][1]) < config.CONFIDENCE_MARGIN:
+        return None
+    return op_id, score, f"lexical match on '{op_id}'"
+
+
+def classify_operation(message: str) -> Intent:
+    """Classify to a catalogue operation. This is what the graph routes on.
+
+    Order is deliberate:
+      1. The emergency gate (deterministic phrases) — a duress or bereavement
+         message must never depend on a classifier's confidence.
+      2. The LLM, two-stage, over the full catalogue.
+      3. Offline: trained label, then lexical search.
+      4. 'clarify' — never a guess.
+    """
+    emergency = catalogue.match_emergency(message)
+    if emergency:
+        return Intent(label=label_for(emergency), confidence=0.99, operation=emergency,
+                      rationale="emergency modifier matched before classification")
+
+    found = _llm_classify_operation(message) if llm.available() else None
+    if found is None:
+        found = _offline_classify_operation(message)
+    if found is None:
+        return Intent(label="clarify", confidence=0.3, operation=None,
+                      rationale="no catalogue operation matched")
+
+    op_id, confidence, rationale = found
+    if not catalogue.exists(op_id):
+        return Intent(label="clarify", confidence=0.3, operation=None,
+                      rationale=f"'{op_id}' is not in the catalogue")
+    if confidence < config.CONFIDENCE_THRESHOLD:
+        return Intent(label="clarify", confidence=confidence, operation=None,
+                      rationale=rationale or "below confidence threshold")
+    return Intent(label=label_for(op_id), confidence=confidence,
+                  operation=op_id, rationale=rationale)
 
 
 def is_hardship(message: str, intent: Intent) -> bool:

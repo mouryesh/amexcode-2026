@@ -10,12 +10,12 @@ from __future__ import annotations
 
 from typing import Any
 
-from agent import escalation, templates, tools
-from agent.classifier import classify, is_hardship
+from agent import catalogue, escalation, templates, tools
+from agent.classifier import classify_operation, is_hardship
 from agent.llm import LLMUnavailable, llm
 from agent.policy_engine import evaluate
 from agent.state import AgentState
-from backend import accounts, sessions
+from backend import accounts, policy_registry, sessions
 from shared import security_filter as secfilter
 from shared.config import config
 from shared.observability import log_event
@@ -106,9 +106,32 @@ def security_filter(state: AgentState) -> AgentState:
 
 
 def classify_intent(state: AgentState) -> AgentState:
-    """Run the classifier; load account facts (incl. distress signal)."""
+    """Run the classifier; load account facts (incl. distress signal).
+
+    A bare slot answer ("42 Brigade Road") carries no intent signal and
+    classifies as 'clarify'. If a flow is already collecting slots, that reply
+    belongs to the open flow — so the flow's intent is restored rather than the
+    conversation restarting. This is the dialogue-act check from DECISION_GRAPH
+    stage 3: decide whether the message is a slot reply BEFORE reclassifying.
+
+    Only 'clarify' is overridden. A message that classifies as a real intent —
+    including hardship — is treated as a genuine topic change and wins, so
+    distress can never be swallowed by an open address flow.
+    """
     message = _last_member_message(state)
-    intent: Intent = classify(message)
+    # Catalogue classification: all 380 operations are reachable, and the
+    # emergency gate inside it runs before any model call.
+    intent: Intent = classify_operation(message)
+
+    if intent.label == "clarify":
+        flow = sessions.get_active_flow(state["session_id"])
+        if flow and flow.get("status") == "collecting_slots" and flow.get("operation"):
+            intent = Intent(
+                label=str(flow["operation"]),
+                confidence=intent.confidence,
+                rationale=f"slot reply within open '{flow['operation']}' flow",
+            )
+
     state["intent"] = intent
     state["confidence"] = intent.confidence
 
@@ -129,7 +152,15 @@ def check_slots(state: AgentState) -> AgentState:
     are marked missing so call_llm can ask for them.
     """
     intent = state["intent"].label
-    slots: dict[str, Any] = dict(state.get("slots", {}))
+    # Slots already collected in this flow are the starting point. The graph is
+    # stateless per turn, so without this seed every turn re-asks for what the
+    # member already answered. Account-resolved values below use setdefault, so
+    # a member-supplied value is never silently overwritten mid-flow.
+    slots: dict[str, Any] = {
+        name: entry["value"] for name, entry in
+        sessions.get_slots(state["session_id"]).items()
+    }
+    slots.update(state.get("slots", {}))
     member_id = state["member_id"]
     member = accounts.get_member(member_id)
 
@@ -198,6 +229,175 @@ def check_slots(state: AgentState) -> AgentState:
     return state
 
 
+_EXTRACT_SYSTEM = (
+    "You extract structured values from a credit-card servicing member's "
+    "message. You only report a value that is genuinely present in the "
+    "message. You never guess, never infer from context, and never invent a "
+    "plausible-looking value. Reporting nothing is correct and expected when "
+    "the member did not supply the value."
+)
+
+
+def _extract_schema_hint(fields: list[str]) -> str:
+    """The exact JSON shape asked of the model, one entry per missing slot."""
+    per_field = ", ".join(
+        f'"{f}": {{"value": <string or null>, "confidence": <0.0-1.0>}}'
+        for f in fields
+    )
+    return "{" + per_field + "}"
+
+
+def extract_slots(state: AgentState) -> AgentState:
+    """Fill still-missing member slots from the raw message, via the LLM.
+
+    Runs AFTER check_slots, never before: account data is authoritative, so a
+    value the read layer resolved is never up for reinterpretation by a model.
+    This node only ever fills gaps check_slots left open.
+
+    Three guards, in order:
+
+      1. Restricted slots are never extracted. A PIN/OTP/CVV must reach the
+         auth backend on a secure channel, never a chat turn — and
+         security_filter has already blocked such a message anyway. This is the
+         second lock on the same door: even if the filter were bypassed, no
+         model output can populate a restricted slot.
+      2. A value below SLOT_EXTRACT_MIN_CONFIDENCE is discarded and re-asked.
+         A wrong address written confidently is worse than one more question.
+      3. Every accepted value is persisted with provenance
+         (source='llm_extraction' plus the model's own confidence), so an
+         auditor can see which values the member asserted versus which the
+         backend resolved.
+
+    Offline (no LLM configured) this is a no-op — the graph still asks, and the
+    attempt counter below still bounds the loop.
+    """
+    missing = list(state.get("missing_slots") or [])
+    # An ambiguous field is a different question (pick one of N), already
+    # handled by the T-SELECT-ITEM template. Don't extract over it.
+    if not missing or state.get("ambiguous_field"):
+        return state
+
+    session_id = state["session_id"]
+    intent = state["intent"].label
+    slots = dict(state.get("slots", {}))
+
+    askable = [s for s in missing if sessions.sensitivity_of(s) != "restricted"]
+
+    if askable and llm.available():
+        try:
+            data = llm.structured_json(
+                _EXTRACT_SYSTEM,
+                f"{_recent_context(state)}The member's request is "
+                f"'{intent}'. Their latest message is:\n"
+                f"{_last_member_message(state)!r}\n\n"
+                f"Extract only these fields if the member actually stated "
+                f"them: {', '.join(askable)}. Use null for anything absent.",
+                _extract_schema_hint(askable),
+            )
+        except (LLMUnavailable, ValueError, KeyError):
+            data = {}
+
+        accepted: dict[str, Any] = {}
+        for name in askable:
+            entry = data.get(name)
+            if not isinstance(entry, dict):
+                continue
+            value = entry.get("value")
+            try:
+                conf = float(entry.get("confidence", 0.0))
+            except (TypeError, ValueError):
+                conf = 0.0
+            if value in (None, "", "null") or conf < config.SLOT_EXTRACT_MIN_CONFIDENCE:
+                continue
+            accepted[name] = value
+            sessions.set_slot(session_id, name, value, source="llm_extraction",
+                              confidence=conf)
+            log_event("slot_extracted", session_id=session_id,
+                      member_id=state["member_id"], slot=name, confidence=conf)
+
+        slots.update(accepted)
+        state["slots_extracted"] = accepted
+
+    state["slots"] = slots
+    required = MEMBER_SLOTS.get(intent, ())
+    still_missing = [s for s in required if slots.get(s) in (None, "")]
+    state["missing_slots"] = still_missing
+    state["slots_complete"] = len(still_missing) == 0 and not state.get("ambiguous_field")
+
+    # Bound the loop. One failed attempt per unfilled slot per turn; at
+    # SLOT_MAX_ATTEMPTS the graph escalates instead of asking again.
+    if still_missing:
+        sessions.start_flow_if_absent(session_id, intent)
+        for name in still_missing:
+            sessions.bump_slot_failure(session_id, name)
+        state["slots_exhausted"] = any(
+            sessions.slot_exhausted(session_id, name) for name in still_missing
+        )
+    return state
+
+
+def _policy_for(state: AgentState) -> str:
+    """The approved policy id for this turn's operation, scoped to the account."""
+    facts = state.get("account_facts") or {}
+    return policy_registry.resolve(
+        state["intent"].operation or "",
+        market=facts.get("market") or "IN",
+        product_family=facts.get("product_family") or "personal_credit",
+    )
+
+
+def policy_bound(state: AgentState) -> bool:
+    """True when an approved policy exists for this turn's operation."""
+    intent = state.get("intent")
+    if not intent or not intent.operation:
+        return False
+    facts = state.get("account_facts") or {}
+    return policy_registry.try_resolve(
+        intent.operation,
+        market=facts.get("market") or "IN",
+        product_family=facts.get("product_family") or "personal_credit",
+    ) is not None
+
+
+def inform_from_source(state: AgentState) -> AgentState:
+    """Answer a READ-ONLY catalogue operation that has no automated flow.
+
+    POL-GLOBAL-011: a read-only request with no explicit branch may still be
+    answered, but only from an approved source — never from the model's own
+    knowledge of what Amex India might charge or allow. So this states what the
+    operation is, declines to invent the substance, and offers the official
+    route. No account read, no write, no policy inference.
+    """
+    op = catalogue.resolve(state["intent"].operation or "")
+    topic = (op.operation.replace("_", " ") if op else "that")
+    state["reply"] = templates.render("T-INFORM-NO-SOURCE", topic=topic)
+    state["awaiting_member"] = False
+    log_event("inform_from_source", session_id=state["session_id"],
+              member_id=state["member_id"], operation=op.id if op else None)
+    return state
+
+
+def fail_closed(state: AgentState) -> AgentState:
+    """A CONSEQUENTIAL catalogue operation with no approved policy.
+
+    The single most important branch in the graph. The operation is real and
+    correctly recognised — it simply has no automation and no rule authorising
+    it, so the one thing that must not happen is an execution. Build a handoff
+    carrying everything already established and say so plainly.
+
+    This is what makes all 380 operations deterministic while six are
+    automated: the other 374 land here or in inform_from_source, never in a
+    tool call.
+    """
+    op = catalogue.resolve(state["intent"].operation or "")
+    state["reply"] = templates.render("T-UNMAPPED")
+    state["unmapped_operation"] = op.id if op else None
+    log_event("fail_closed", session_id=state["session_id"],
+              member_id=state["member_id"], operation=op.id if op else None,
+              flow=op.flow if op else None)
+    return build_escalation(state)
+
+
 def run_policy(state: AgentState) -> AgentState:
     """Evaluate the policy for this intent; append the Decision to state.
 
@@ -207,7 +407,13 @@ def run_policy(state: AgentState) -> AgentState:
     layer, not inside policy_engine.py.
     """
     intent = state["intent"].label
-    policy_id = tools.INTENT_POLICY[intent]
+    # Dispatch through the registry, keyed on the CANONICAL operation and scoped
+    # by market and product family — the same intent takes a different policy on
+    # a charge card or outside India. The graph only routes here when
+    # try_resolve() already succeeded, so resolve() cannot raise; if it somehow
+    # does, PolicyNotBound is a ServicingError and routes.py returns 422 rather
+    # than the agent inventing an outcome.
+    policy_id = _policy_for(state)
     decision = evaluate(policy_id, state["account_facts"])
 
     if decision.outcome == Outcome.DECLINE:
@@ -239,6 +445,27 @@ def call_llm(state: AgentState) -> AgentState:
     intent = state["intent"]
     message = _last_member_message(state)
     context = _recent_context(state)
+
+    # 0. Loop breaker. Before asking ANY question, check whether this is the
+    # same question about the same state for the third time. A member trapped
+    # in a repeating exchange with no human is the failure mode the whole
+    # bounded-loop design exists to prevent, and until now check_loop() was
+    # written but never called. Hash the thing that should change between
+    # turns — the intent and what is still outstanding — not the reply text,
+    # which an LLM rephrases every turn and so never repeats.
+    signature = "|".join([
+        intent.label,
+        intent.operation or "",
+        ",".join(sorted(state.get("missing_slots") or [])),
+        state.get("ambiguous_field") or "",
+    ])
+    if sessions.check_loop(state["session_id"], signature):
+        log_event("loop_broken", session_id=state["session_id"],
+                  member_id=state["member_id"], signature=signature)
+        state["reply"] = templates.render("T-LOOP-STOP")
+        state["loop_broken"] = True
+        state["awaiting_member"] = False
+        return state
 
     # 1. Below-threshold classification → ask a clarifying question.
     if intent.label == "clarify":
@@ -337,9 +564,19 @@ def execute_tool(state: AgentState) -> AgentState:
 
     # Tier gate not satisfied → ask the member and hand control back.
     if result.status == tools.STATUS_AWAITING_CONFIRM:
+        # Disclose the consequences with the ask, not after it. A confirmation
+        # obtained without them is a confirmation of nothing (POL-GLOBAL-003).
+        consequences = tools.CONSEQUENCES.get(tool_name, "")
+        # Name the action from the catalogue operation, not the short label:
+        # "temporarily block card" is what the member asked for, "card block"
+        # is an internal bucket name.
+        op = catalogue.resolve(state["intent"].operation or "")
+        action = (op.operation if op else intent).replace("_", " ")
+        card = slots.get("card_id", "")
         state["reply"] = (
-            f"I can do that for you. To confirm: I'll {intent.replace('_', ' ')} "
-            f"for card {slots.get('card_id', '')}. Shall I go ahead?"
+            f"Before I do that — I'll {action}" + (f" for card {card}" if card else "") + "."
+            + (f"\n\n{consequences}" if consequences else "")
+            + "\n\nReply 'confirm' to go ahead, or 'cancel' to stop."
         )
         state["awaiting_member"] = True
     elif result.status == tools.STATUS_AWAITING_STEP_UP:
@@ -358,6 +595,13 @@ def build_escalation(state: AgentState) -> AgentState:
     # Reason: an explicit ESCALATE decision, else hardship, else out-of-scope.
     if decisions and decisions[-1].outcome == Outcome.ESCALATE:
         reason = f"{decisions[-1].reason_code}: {decisions[-1].reason_text}"
+    elif state.get("unmapped_operation"):
+        # Name the exact catalogue operation and the flow that owns it, so the
+        # specialist starts from the right desk instead of re-triaging.
+        op = catalogue.resolve(str(state["unmapped_operation"]))
+        reason = (f"POLICY_NOT_BOUND: '{state['unmapped_operation']}' is a recognised "
+                  f"catalogue operation with no approved policy"
+                  + (f"; owning flow {op.flow}, profile {op.state_profile}." if op else "."))
     elif intent.label == "hardship" or state["account_facts"].get("distress_signals"):
         reason = "HARDSHIP_SIGNAL: member expressed financial distress; duty of care."
     else:
@@ -385,11 +629,14 @@ def build_escalation(state: AgentState) -> AgentState:
 
     state["escalation_packet"] = packet
     state["escalate"] = True
-    state["reply"] = (
-        "I understand this is important, and I want to make sure you get the right "
-        "support. I've connected you with a specialist and passed along the full "
-        "context so you won't have to repeat yourself."
-    )
+    # fail_closed and the loop breaker already rendered their approved template;
+    # don't overwrite a more specific explanation with the generic one.
+    if not state.get("reply"):
+        state["reply"] = (
+            "I understand this is important, and I want to make sure you get the right "
+            "support. I've connected you with a specialist and passed along the full "
+            "context so you won't have to repeat yourself."
+        )
     return state
 
 

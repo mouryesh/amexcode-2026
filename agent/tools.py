@@ -59,6 +59,20 @@ class Tool:
     read_only: bool = False
 
 
+# What the member must be told BEFORE a propose_confirm action runs. Kept as
+# data next to the tier it belongs to: a tier that demands confirmation without
+# disclosing consequences is a confirmation of nothing.
+CONSEQUENCES: dict[str, str] = {
+    "block_card": (
+        "New purchases will be declined straight away. Recurring bills, "
+        "card-on-file payments, digital-wallet and offline transactions may "
+        "still post. The card unblocks automatically after 7 days unless you "
+        "unblock it sooner. This is not the same as reporting it lost, which "
+        "cancels the card permanently."
+    ),
+}
+
+
 def _idem_key(session_id: str, tool: str) -> str:
     """One write per (session, tool) — replaying a turn never double-executes."""
     return f"{session_id}:{tool}"
@@ -75,7 +89,14 @@ TOOLS: dict[str, Tool] = {
         # `reason` must be declared, not just present in slots: execute() only
         # forwards the kwargs a tool declares, so omitting it here dropped the
         # argument and blew up inside actions.block_card.
-        "block_card", AutonomyTier.AUTO, ("card_id", "reason"),
+        #
+        # PROPOSE_CONFIRM, not AUTO. A block stops new purchases immediately but
+        # recurring bills, card-on-file and offline authorisations can still
+        # post, and the card auto-unblocks after 7 days — consequences the
+        # member has to be told BEFORE it happens, not after (POL-GLOBAL-003).
+        # Running it on AUTO meant "the merchant refused my card" blocked the
+        # card on a misclassification, with no way for the member to stop it.
+        "block_card", AutonomyTier.PROPOSE_CONFIRM, ("card_id", "reason"),
         run=actions.block_card,
     ),
     "issue_replacement": Tool(

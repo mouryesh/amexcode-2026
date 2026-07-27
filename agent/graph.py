@@ -8,7 +8,8 @@ the entire control flow:
       → classify_intent
       → [low confidence]      → call_llm (clarify)         → END (awaiting)
       → [hardship / distress] → build_escalation           → END
-      → check_slots
+      → check_slots → extract_slots
+      → [slots exhausted]     → build_escalation           → END
       → [slots incomplete]    → call_llm (ask)             → END (awaiting)
       → [out-of-scope intent] → build_escalation           → END
       → [direct-tool intent]  → execute_tool → respond     → END
@@ -30,9 +31,9 @@ Imports: nodes, state.
 """
 from __future__ import annotations
 
-from agent import nodes
+from agent import catalogue, nodes
 from agent.state import AgentState
-from agent.tools import INTENT_DIRECT_TOOL, INTENT_POLICY
+from agent.tools import INTENT_DIRECT_TOOL
 from shared.schemas import Outcome
 
 # --------------------------------------------------------------------------- #
@@ -52,14 +53,33 @@ def route_after_classify(state: AgentState) -> str:
 
 
 def route_after_slots(state: AgentState) -> str:
+    # A slot asked SLOT_MAX_ATTEMPTS times with no usable answer stops being a
+    # question and becomes a handoff. Checked before "ask" so the fourth
+    # question is never rendered.
+    if state.get("slots_exhausted"):
+        return "escalate"
     if not state.get("slots_complete", True):
         return "ask"
-    intent = state["intent"].label
-    if intent in INTENT_POLICY:
+
+    # Catalogue-driven dispatch. Order matters and each step is fail-safe:
+    #
+    #   1. an APPROVED POLICY exists          -> evaluate it (the only path to a
+    #                                            consequential write)
+    #   2. a BUILT DIRECT TOOL exists         -> execute it
+    #   3. read-only, no policy               -> inform from an approved source
+    #   4. consequential, no policy           -> fail closed, never execute
+    #
+    # Steps 3 and 4 are what make all 380 catalogue operations deterministic
+    # while only six are automated (POL-GLOBAL-008 and POL-GLOBAL-011). An
+    # operation nobody has built lands in one of them — it can never reach a
+    # tool by falling through.
+    if nodes.policy_bound(state):
         return "policy"
-    if intent in INTENT_DIRECT_TOOL:
+    if state["intent"].label in INTENT_DIRECT_TOOL:
         return "direct_tool"
-    return "escalate"  # mapped-but-not-built categories
+    if not catalogue.is_consequential(state["intent"].operation or ""):
+        return "inform"
+    return "fail_closed"
 
 
 def route_after_policy(state: AgentState) -> str:
@@ -89,11 +109,16 @@ def _run_fallback(state: AgentState) -> AgentState:
         return nodes.build_escalation(state)
 
     state = nodes.check_slots(state)
+    state = nodes.extract_slots(state)
     branch = route_after_slots(state)
     if branch == "ask":
         return nodes.call_llm(state)          # awaiting member
     if branch == "escalate":
         return nodes.build_escalation(state)
+    if branch == "inform":
+        return nodes.inform_from_source(state)
+    if branch == "fail_closed":
+        return nodes.fail_closed(state)
     if branch == "direct_tool":
         state = nodes.execute_tool(state)
         return nodes.respond_to_member(state)
@@ -121,10 +146,13 @@ def _build_langgraph():
     g.add_node("security_filter", nodes.security_filter)
     g.add_node("classify_intent", nodes.classify_intent)
     g.add_node("check_slots", nodes.check_slots)
+    g.add_node("extract_slots", nodes.extract_slots)
     g.add_node("run_policy", nodes.run_policy)
     g.add_node("call_llm", nodes.call_llm)
     g.add_node("execute_tool", nodes.execute_tool)
     g.add_node("build_escalation", nodes.build_escalation)
+    g.add_node("inform_from_source", nodes.inform_from_source)
+    g.add_node("fail_closed", nodes.fail_closed)
     g.add_node("respond_to_member", nodes.respond_to_member)
 
     g.add_edge(START, "security_filter")
@@ -138,11 +166,15 @@ def _build_langgraph():
         route_after_classify,
         {"clarify": "call_llm", "escalate": "build_escalation", "check_slots": "check_slots"},
     )
+    # check_slots resolves from account data; extract_slots then fills what is
+    # left from the member's own words. Routing happens only after both.
+    g.add_edge("check_slots", "extract_slots")
     g.add_conditional_edges(
-        "check_slots",
+        "extract_slots",
         route_after_slots,
         {"ask": "call_llm", "policy": "run_policy",
-         "direct_tool": "execute_tool", "escalate": "build_escalation"},
+         "direct_tool": "execute_tool", "escalate": "build_escalation",
+         "inform": "inform_from_source", "fail_closed": "fail_closed"},
     )
     g.add_conditional_edges(
         "run_policy",
@@ -160,6 +192,8 @@ def _build_langgraph():
     g.add_edge("execute_tool", "respond_to_member")
     g.add_edge("respond_to_member", END)
     g.add_edge("build_escalation", END)
+    g.add_edge("inform_from_source", END)
+    g.add_edge("fail_closed", END)
     return g.compile()
 
 

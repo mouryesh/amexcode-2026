@@ -50,6 +50,11 @@ _SLOT_SENSITIVITY: dict[str, str] = {
     "requested_increase_pct": "internal", "replacement_reason": "internal",
     "reason": "internal", "delivery_address_choice": "internal",
     "statement_period": "internal", "new_address": "internal",
+    # The graph's slot is named `address` (agent/nodes.py MEMBER_SLOTS,
+    # agent/tools.py update_address). Only `new_address` was classified here,
+    # so `address` fell to the restricted default and could never be collected
+    # or retained. Same field, both spellings, same classification.
+    "address": "internal",
 
     "information_topic": "public",
 }
@@ -211,6 +216,20 @@ def start_flow(
     return doc["active_flow"]
 
 
+def start_flow_if_absent(session_id: str, operation: str) -> dict[str, Any]:
+    """Open a slot-collecting flow for `operation`, or return the open one.
+
+    Called the first time the agent has to ask the member for a slot. The flow
+    is what makes the next turn's bare answer ("42 Brigade Road") resolvable —
+    it is where the intent and the already-collected slots live between turns.
+    """
+    flow = get_active_flow(session_id)
+    if flow and flow.get("operation") == operation:
+        return flow
+    doc = open_session(session_id)
+    return start_flow(session_id, f"f-{doc['turn_count']}", "servicing", operation)
+
+
 def get_active_flow(session_id: str) -> Optional[dict[str, Any]]:
     doc = docstore.get(session_id)
     return (doc or {}).get("active_flow")
@@ -359,6 +378,10 @@ def terminalize(session_id: str, outcome: str) -> None:
             "closed_at": _iso(),
         })
     doc["active_flow"] = None
+    # Per-slot attempt counts belong to the flow that was asking, not to the
+    # session. Leaving them set would start a second address change already at
+    # its third strike.
+    doc["dialogue"]["invalid_slot_count_by_slot"] = {}
     _save(doc)
 
 

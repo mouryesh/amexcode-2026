@@ -44,11 +44,25 @@ class AutonomyTier(str, Enum):
 # Classifier output
 # --------------------------------------------------------------------------- #
 class Intent(BaseModel):
-    """Classified intent label + confidence score."""
+    """Classified intent: the catalogue operation, plus the legacy short label.
 
-    label: str = Field(..., description="One of the 12 taxonomy categories, or 'clarify'.")
+    `operation` is the canonical `domain.operation` id from
+    specs/amex_in_catalog.yaml — the only thing that routes, and the key
+    backend/policy_registry.py is written against. All 380 are reachable.
+
+    `label` is the short form for the eight operations that have a built tool
+    or policy ('fee_waiver', 'card_block', ...), or 'clarify'. It exists so the
+    UI and the older tests keep working; it is derived from `operation`, never
+    the other way round. An operation with no built automation has label
+    'unmapped' and routes to a handoff.
+    """
+
+    label: str = Field(..., description="Short label for a built flow, 'clarify', or 'unmapped'.")
     confidence: float = Field(..., ge=0.0, le=1.0)
     rationale: Optional[str] = Field(None, description="Short model explanation (debug only).")
+    operation: Optional[str] = Field(
+        None, description="Canonical `domain.operation` id from the catalogue."
+    )
 
 
 # --------------------------------------------------------------------------- #
