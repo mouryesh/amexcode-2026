@@ -174,5 +174,8 @@ def seed() -> None:
 
 if __name__ == "__main__":
     seed()
-    print("Seeded 4 personas, 5 cards, 5 fees, 24 billing periods.")
-    print("Priya holds two cards with a fee on each — the disambiguation case.")
+    # Counted from the data, not hardcoded — a stale summary line is a small
+    # lie that costs trust in the rest of the output.
+    print(f"Seeded {len(_ACCOUNTS)} personas, {len(_CARDS)} cards, "
+          f"{len(_TXNS)} fees, {len(_PAYMENTS)} billing periods.")
+    print("Deepa holds two cards with a fee on each — the disambiguation case.")
