@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
 from backend import actions
+from shared.config import config
 from shared.schemas import AutonomyTier, Receipt
 
 # --------------------------------------------------------------------------- #
@@ -32,6 +33,10 @@ class ToolResult:
     tier: AutonomyTier
     receipt: Optional[Receipt] = None
     message: str = ""
+    # "simulated" when the step-up gate was satisfied by the stub rather than a
+    # real auth backend. Carried into the ledger deliberately: a run that never
+    # re-authenticated must not be auditable as one that did.
+    step_up: str = ""
 
     def as_record(self) -> dict[str, Any]:
         """Flatten to the dict appended to state.actions_taken / ledger view."""
@@ -40,6 +45,8 @@ class ToolResult:
             "tier": self.tier.value,
             "status": self.status,
         }
+        if self.step_up:
+            rec["step_up"] = self.step_up
         if self.receipt is not None:
             rec["receipt"] = self.receipt.model_dump()
         if self.message:
@@ -117,8 +124,11 @@ TOOLS: dict[str, Tool] = {
     ),
     "reset_pin": Tool(
         "reset_pin", AutonomyTier.AUTO_STEP_UP, (),
-        run=lambda **kw: Receipt(reference="PIN-RESET", action="reset_pin",
-                                 detail="PIN reset link sent after re-authentication."),
+        run=lambda **kw: Receipt(
+            reference="PIN-RESET", action="reset_pin",
+            detail="A single-use PIN Management link has been sent to your "
+                   "registered email and mobile. Set the new PIN on that secure "
+                   "Amex screen — never type a PIN into this chat."),
     ),
     "update_address": Tool(
         "update_address", AutonomyTier.AUTO_STEP_UP, ("address",),
@@ -184,6 +194,12 @@ def execute(
     tool = TOOLS[tool_name]
 
     gate = _check_tier(tool, confirm, reauthenticated)
+    step_up = ""
+    if gate == STATUS_AWAITING_STEP_UP and config.STEP_UP_SIMULATED:
+        # No auth service is wired to this prototype, so the challenge is
+        # stubbed rather than skipped: the action proceeds, and the result says
+        # in the ledger that the re-authentication was simulated.
+        gate, step_up = None, "simulated"
     if gate is not None:
         return ToolResult(gate, tool.name, tool.tier)
 
@@ -192,7 +208,7 @@ def execute(
     # Read-only tools don't write or touch idempotency.
     if tool.read_only:
         receipt = tool.run(member_id=member_id, **slots)
-        return ToolResult(STATUS_OK, tool.name, tool.tier, receipt=receipt)
+        return ToolResult(STATUS_OK, tool.name, tool.tier, receipt=receipt, step_up=step_up)
 
     # Build the delegated call. Only pass kwargs the backend function accepts;
     # the write functions all take member_id + idempotency_key + session_id.
@@ -208,7 +224,7 @@ def execute(
         kwargs["decision"] = decision
 
     receipt = tool.run(**kwargs)
-    return ToolResult(STATUS_OK, tool.name, tool.tier, receipt=receipt)
+    return ToolResult(STATUS_OK, tool.name, tool.tier, receipt=receipt, step_up=step_up)
 
 
 # --------------------------------------------------------------------------- #

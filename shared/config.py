@@ -88,6 +88,14 @@ class Config:
     SLOT_EXTRACT_MIN_CONFIDENCE: float = float(_env("SLOT_EXTRACT_MIN_CONFIDENCE", "0.7"))
     CLARIFY_MAX_QUESTIONS: int = int(_env("CLARIFY_MAX_QUESTIONS", "2"))
     CONFIRM_TTL_S: int = int(_env("CONFIRM_TTL_S", "120"))
+    # There is no auth backend wired to this prototype, so an auto_step_up
+    # action has nothing to re-authenticate against and would hang forever.
+    # With this on, the secure challenge is SIMULATED: the tier is still
+    # declared and still enforced, the flow still passes through it, and every
+    # ledger row records step_up="simulated" so no run can be mistaken for a
+    # real re-authentication. Set STEP_UP_SIMULATED=false the day an auth
+    # service exists; nothing else changes.
+    STEP_UP_SIMULATED: bool = _flag("STEP_UP_SIMULATED", "true")
     FLOW_IDLE_TIMEOUT_S: int = int(_env("FLOW_IDLE_TIMEOUT_S", "600"))
     RECONCILE_MAX_POLLS: int = int(_env("RECONCILE_MAX_POLLS", "3"))
 

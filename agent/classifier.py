@@ -209,9 +209,23 @@ OPERATION_TO_LABEL: dict[str, str] = {
     "card_lifecycle_controls.report_lost_card": "card_replacement",
     "card_lifecycle_controls.replace_not_received_card": "card_replacement",
     "card_lifecycle_controls.temporarily_block_card": "card_block",
+    # All four PIN operations are the same servicing action — open the secure
+    # PIN flow — so they share the one built tool. Splitting them by catalogue
+    # name meant "I forgot my PIN" failed closed while "change my PIN" worked,
+    # which is a worse answer to the same request.
     "card_lifecycle_controls.change_pin": "reset_pin",
+    "card_lifecycle_controls.forgot_pin": "reset_pin",
+    "card_lifecycle_controls.pin_locked": "reset_pin",
+    "card_lifecycle_controls.view_pin": "reset_pin",
     "transaction_activity.identify_merchant_name": "explain_charge",
+    # Balance and limit reads exist in two domains and mean the same thing.
+    # Answering from real account data beats the generic "no approved source".
     "statements_balances.view_current_balance": "account_info",
+    "statements_balances.view_available_credit": "account_info",
+    "statements_balances.view_credit_limit": "account_info",
+    "credit_spending_power.view_available_credit": "account_info",
+    "credit_spending_power.view_credit_limit": "account_info",
+    "transaction_activity.view_recent_transactions": "explain_charge",
     "profile_preferences.update_address": "update_address",
     "hardship_collections.cannot_pay": "hardship",
     "hardship_collections.job_loss": "hardship",

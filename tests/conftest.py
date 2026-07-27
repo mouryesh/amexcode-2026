@@ -11,3 +11,12 @@ import tempfile
 _TMP = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
 os.environ["DB_PATH"] = _TMP.name
 os.environ.setdefault("LLM_PROVIDER", "offline")
+
+# Pin the engine, don't just point at a temp file. A developer with PG_DSN set
+# in .env would otherwise run the whole suite against their real Postgres: the
+# tests write raw SQLite SQL (`?` placeholders, sqlite_sequence), so they failed
+# loudly rather than corrupting anything — but `pytest -q` was red out of the
+# box for anyone following RUN.md's Postgres setup. The suite chooses SQLite;
+# scripts/smoke.py is what exercises Postgres.
+os.environ["PG_DSN"] = ""
+os.environ["MONGO_URI"] = ""

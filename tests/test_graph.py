@@ -12,6 +12,7 @@ from agent.state import new_state
 from backend import ledger
 from backend.database import db_session
 from backend.seed import seed
+from shared.config import config
 from shared.schemas import Outcome
 
 
@@ -68,12 +69,33 @@ def test_propose_confirm_requires_confirmation():
                for a in withc["actions_taken"])
 
 
-def test_step_up_requires_reauthentication():
+def test_step_up_requires_reauthentication(monkeypatch):
+    """With the stub off, an auto_step_up tool will not run un-reauthenticated."""
+    monkeypatch.setattr(config, "STEP_UP_SIMULATED", False)
     without = _run("MEM-PRIYA", "reset my pin")
     assert without["awaiting_member"] is True
+    assert not [a for a in without["actions_taken"] if a["status"] == "ok"]
+
     withr = _run("MEM-PRIYA", "reset my pin", reauthenticated=True)
-    assert any(a["tool"] == "reset_pin" and a["status"] == "ok"
-               for a in withr["actions_taken"])
+    ok = [a for a in withr["actions_taken"] if a["tool"] == "reset_pin"
+          and a["status"] == "ok"]
+    assert ok
+    # A genuine re-authentication is never marked simulated.
+    assert "step_up" not in ok[0]
+
+
+def test_simulated_step_up_completes_but_says_so_in_the_ledger(monkeypatch):
+    """The demo stub must never be auditable as a real re-authentication."""
+    monkeypatch.setattr(config, "STEP_UP_SIMULATED", True)
+    s = _run("MEM-PRIYA", "reset my pin")
+    ok = [a for a in s["actions_taken"] if a["tool"] == "reset_pin"
+          and a["status"] == "ok"]
+    assert ok, "simulated step-up should let the action complete"
+    assert ok[0]["step_up"] == "simulated"
+    assert ok[0]["tier"] == "auto_step_up", "the tier is still declared, not removed"
+    # The reply hands the member to the secure channel; it never asks for a PIN.
+    assert "PIN" in s["reply"]
+    assert "secure" in s["reply"].lower()
 
 
 def test_low_confidence_asks_to_clarify():
