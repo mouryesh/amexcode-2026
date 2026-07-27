@@ -69,6 +69,15 @@ class Decision(BaseModel):
     policy_version: str
     inputs_used: dict[str, Any] = Field(default_factory=dict)
     rule_id: Optional[str] = Field(None, description="Which rule branch fired.")
+    # Provenance of the rule that fired: is this a real, sourced Amex India
+    # public rule, or an illustrative control invented for this prototype?
+    # See policies/*.yaml — every rule declares its own source_tag/source_ref.
+    source_tag: Optional[str] = Field(
+        None, description="amex_public | regulatory_public | project_control | ..."
+    )
+    source_ref: Optional[str] = Field(
+        None, description="URL or internal reference backing this rule."
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -135,6 +144,10 @@ class AgentRequest(BaseModel):
     action, the client resubmits the SAME `message` with `confirm=true`
     (or `reauthenticated=true`) to complete it. This keeps session state out of
     the agent and in the caller, and makes every turn independently replayable.
+
+    The same pattern covers disambiguation: when a response asks the member to
+    choose among numbered options (T-SELECT-ITEM), the client resubmits the
+    SAME `message` with `selected_option` set to the chosen number.
     """
 
     session_id: str
@@ -144,6 +157,7 @@ class AgentRequest(BaseModel):
     # completing a step-up re-authentication challenge.
     confirm: bool = False
     reauthenticated: bool = False
+    selected_option: Optional[int] = None
 
 
 class AgentResponse(BaseModel):

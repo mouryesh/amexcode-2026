@@ -1,19 +1,18 @@
-# card.replacement.v1 — replacement / reissue eligibility.
+# Card replacement policy — the specific thresholds (fraud_hold flag,
+# 30-day dedup window) are project_control, but the general SHAPE of the
+# fraud/security branch matches real Amex India public guidance: a lost/
+# stolen/compromised card is routed through a dedicated security process,
+# not treated as routine self-serve reissue (SRC-LOST-STOLEN, SRC-REPORT-FRAUD).
 #
-# Mirrors POLICIES.md §5 (POL-CARD-001..006). Read by agent/policy_engine.py:
-# rules evaluate top-to-bottom, FIRST full match wins, else `default`.
-# Card replacement is a propose_confirm action: this policy governs whether a
-# replacement may be OFFERED; the member still confirms before it commits.
-#
-# Outcome mapping: approve->APPROVE, deny->DECLINE, escalate->ESCALATE,
-# needs_input->QUEUE.  Source tags: amex_firsthand | industry_standard
-#
-# Rules using existing facts come first; `requires_fact:` rules fire once that
-# fact is added to get_account_facts() + seed.
+# Card replacement is a propose_confirm action: the agent proposes, the member
+# confirms, then the write commits. This policy governs whether a replacement
+# may be offered at all. Rules evaluate top-to-bottom; first full match wins.
 
 policy_id: card.replacement
 version: v1
 description: Assess eligibility to issue a replacement card.
+source_tag: project_control
+source_ref: approved_architecture
 
 default:
   outcome: APPROVE
@@ -23,9 +22,6 @@ default:
 
 rules:
   - id: hardship_detected
-    policy_ref: POL-CARD-001
-    tier: 0
-    source: amex_firsthand
     when:
       - { field: distress_signals, op: eq, value: true }
     outcome: ESCALATE
@@ -34,11 +30,8 @@ rules:
       We want to make sure you're supported — connecting you with a specialist.
     rationale: Distress signals override routine servicing.
 
+  # Fraud hold on the account routes to the fraud team, not self-serve reissue.
   - id: fraud_hold
-    policy_ref: POL-CARD-003
-    tier: 1
-    source: amex_firsthand
-    source_ref: "reissue under an active fraud hold defeats the hold"
     when:
       - { field: fraud_hold, op: eq, value: true }
     outcome: ESCALATE
@@ -48,10 +41,8 @@ rules:
       specialist will handle the replacement with you directly.
     rationale: Reissuing under a fraud hold could defeat the hold's purpose.
 
+  # A replacement was already issued very recently — avoid duplicate plastic.
   - id: recent_replacement
-    policy_ref: POL-CARD-006
-    tier: 2
-    source: industry_standard
     when:
       - { field: replacements_30d, op: gte, value: 1 }
     outcome: QUEUE
@@ -60,53 +51,3 @@ rules:
       A replacement card was already issued in the last 30 days. We've flagged
       this for a quick check to avoid sending a duplicate.
     rationale: Guards against repeated reissue loops.
-
-# planned_rules: doc rules that need a new fact. NOT evaluated by the engine
-# (it reads only `rules:` above). Move an entry up into `rules:` once
-# get_account_facts() + seed supply the field named in `requires_fact:`.
-planned_rules:
-  - id: stolen_with_suspected_fraud
-    policy_ref: POL-CARD-003
-    tier: 1
-    source: amex_firsthand
-    source_ref: "stolen report + unauthorized activity -> fraud review, not plain reissue"
-    requires_fact: reason, unauthorized_activity_suspected
-    when:
-      - { field: reason, op: eq, value: stolen }
-      - { field: unauthorized_activity_suspected, op: eq, value: true }
-    outcome: ESCALATE
-    reason_code: SUSPECTED_FRAUD
-    reason_text: >-
-      Because this card was stolen and there may be unauthorized activity, a
-      fraud specialist will handle the replacement and review recent charges.
-    rationale: A stolen report with suspicious activity is a fraud matter.
-
-  - id: new_shipping_address
-    policy_ref: POL-CARD-004
-    tier: 1
-    source: industry_standard
-    source_ref: "replacement ships to address on file only"
-    requires_fact: new_shipping_address_requested
-    when:
-      - { field: new_shipping_address_requested, op: eq, value: true }
-    outcome: ESCALATE
-    reason_code: ADDRESS_CHANGE_REQUESTED
-    reason_text: >-
-      For your security we can only ship a replacement to the address on file.
-      A specialist will help if you need it sent somewhere else.
-    rationale: Mid-chat address change is a fraud-risk vector; never self-serve.
-
-  - id: expiring_card_auto_renews
-    policy_ref: POL-CARD-006
-    tier: 1
-    source: amex_firsthand
-    source_ref: "expiring cards auto-renew to address on file; no request needed"
-    requires_fact: reason
-    when:
-      - { field: reason, op: eq, value: expiring }
-    outcome: DECLINE
-    reason_code: EXPIRING_AUTO_RENEW
-    reason_text: >-
-      No action needed — your renewal card is mailed automatically and arrives
-      by the middle of your expiration month.
-    rationale: Expiring cards are auto-handled; inform rather than reissue.

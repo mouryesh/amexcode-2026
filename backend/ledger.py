@@ -112,20 +112,24 @@ def append_on_conn(
     inputs_json = _canonical(inputs)
     decision_json = _canonical(decision) if decision is not None else None
 
-    row = conn.execute(
+    cur = conn.execute(
         """INSERT INTO audit_ledger
               (trace_id, session_id, member_ref, event_type, actor, action,
                occurred_at, inputs, decision, prev_hash, record_hash)
-           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-           RETURNING record_id""",
+           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)""",
         (
             trace_id, session_id, member_ref, event_type, actor, action,
             occurred_at, inputs_json, decision_json, prev_hash, record_hash,
         ),
-    ).fetchone()
+    )
+    # RETURNING would be cleaner but is not portable across both engines here,
+    # and the id is safe to read back inside this lock-holding transaction.
+    record_id = conn.execute(
+        "SELECT record_id FROM audit_ledger WHERE record_hash = %s", (record_hash,)
+    ).fetchone()["record_id"]
 
     record = {
-        "record_id": row["record_id"],
+        "record_id": record_id,
         "trace_id": trace_id,
         "session_id": session_id,
         "member_ref": member_ref,

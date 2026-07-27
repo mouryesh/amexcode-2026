@@ -1,32 +1,64 @@
-"""backend/sessions.py — conversation and flow state, on MongoDB.
+"""backend/sessions.py — conversation and flow state.
 
-One document per session. It holds the transcript, the active flow with its
-slots and provenance, the queue of deferred intents, risk signals and the
-dialogue counters that bound every loop in the graph.
+One document per session: the transcript, the active flow with its slots and
+their provenance, the queue of deferred intents, risk signals, and the dialogue
+counters that bound every loop in the graph.
 
 The three functions the agent layer already used — `record_turn`,
-`get_history`, `count_prior_declines` — keep their signatures, so nothing
-upstream changed. Everything else is new surface the graph needs: slot writes
-that carry provenance, loop counters that can actually be enforced, and the
-terminalise step that purges ephemeral secrets.
+`get_history`, `count_prior_declines` — keep their signatures. Everything else
+is new surface the graph needs.
 
-Nothing here is authoritative. Losing a session document loses the conversation,
-not the audit trail — decisions and writes are in the Postgres chain.
+Storage is whole-document via `docstore`, so this file has one implementation
+regardless of whether Mongo is running.
 
-Imports: backend.mongo, shared.config.
+Nothing here is authoritative. Losing a session loses the conversation, not the
+audit trail — decisions and writes live in the Postgres chain.
+
+Imports: backend.docstore, shared.config.
 """
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
-from backend.mongo import sessions_col
+from backend import docstore
 from shared.config import config
+from shared.redaction import redact
 
-# Slot values that must never survive a terminal state, per the retention rules.
-_EPHEMERAL_SLOT_KEYS = frozenset(
-    {"otp", "pin", "new_pin", "cvv", "password", "security_answer", "full_pan", "aadhaar"}
-)
+# Sensitivity is a property of WHAT the data is, not where it came from — a
+# member typing a card nickname is `internal`, a member typing an OTP is
+# `restricted`, same source. So it is looked up by slot name, never passed in
+# by the caller and never inferred from `source`.
+#
+# An unlisted slot is `restricted`, not `internal`. Deliberate: the cost of the
+# strict default is losing context on close, the cost of a permissive default is
+# retaining a secret you promised not to. Only one of those is acceptable.
+_SLOT_SENSITIVITY: dict[str, str] = {
+    "otp": "restricted", "pin": "restricted", "new_pin": "restricted",
+    "current_pin": "restricted", "cvv": "restricted", "cvv_or_cid": "restricted",
+    "password": "restricted", "security_answer": "restricted",
+    "full_pan": "restricted", "aadhaar": "restricted", "full_aadhaar": "restricted",
+    "bank_account_number": "restricted",
+
+    "member_reason": "confidential", "hardship_detail": "confidential",
+    "dispute_reason": "confidential",
+
+    "card_selection": "internal", "card_id": "internal",
+    "fee_transaction_selection": "internal", "transaction_selection": "internal",
+    "txn_ref": "internal", "fee_amount": "internal",
+    "requested_limit": "internal", "new_limit": "internal",
+    "requested_increase_pct": "internal", "replacement_reason": "internal",
+    "reason": "internal", "delivery_address_choice": "internal",
+    "statement_period": "internal", "new_address": "internal",
+
+    "information_topic": "public",
+}
+_DEFAULT_SENSITIVITY = "restricted"
+
+
+def sensitivity_of(slot_name: str) -> str:
+    """Classification for a slot. Unknown names fail safe to `restricted`."""
+    return _SLOT_SENSITIVITY.get(slot_name.lower(), _DEFAULT_SENSITIVITY)
 
 
 def _now() -> datetime:
@@ -38,9 +70,8 @@ def _iso(dt: Optional[datetime] = None) -> str:
 
 
 def _blank(session_id: str, member_ref: Optional[str]) -> dict[str, Any]:
-    now = _now()
+    now = _iso()
     return {
-        "_id": session_id,
         "session_id": session_id,
         "member_ref": member_ref,
         "channel": "web",
@@ -49,12 +80,11 @@ def _blank(session_id: str, member_ref: Optional[str]) -> dict[str, Any]:
         "session_status": "open",
         "started_at": now,
         "last_activity_at": now,
-        # TTL: flow state is disposable well before the audit trail is.
-        "expires_at": now + timedelta(days=30),
         "turn_count": 0,
         "transcript": [],
         "active_flow": None,
         "queued_flows": [],
+        "completed_flows": [],
         "risk": {
             "fraud_signal": "none",
             "financial_hardship_signal": "none",
@@ -74,24 +104,25 @@ def _blank(session_id: str, member_ref: Optional[str]) -> dict[str, Any]:
 
 def open_session(session_id: str, member_ref: Optional[str] = None) -> dict[str, Any]:
     """Fetch the session, creating it on first contact. Idempotent."""
-    col = sessions_col()
-    doc = col.find_one({"_id": session_id})
+    doc = docstore.get(session_id)
     if doc is None:
         doc = _blank(session_id, member_ref)
-        col.insert_one(doc)
+        docstore.put(session_id, doc)
         return doc
     if member_ref and not doc.get("member_ref"):
-        col.update_one({"_id": session_id}, {"$set": {"member_ref": member_ref}})
         doc["member_ref"] = member_ref
+        docstore.put(session_id, doc)
     return doc
 
 
 def get_session(session_id: str) -> Optional[dict[str, Any]]:
-    return sessions_col().find_one({"_id": session_id})
+    return docstore.get(session_id)
 
 
-def _touch() -> dict[str, Any]:
-    return {"last_activity_at": _now()}
+def _save(doc: dict[str, Any]) -> None:
+    doc["last_activity_at"] = _iso()
+    doc["audit"]["state_version"] = doc["audit"].get("state_version", 0) + 1
+    docstore.put(doc["session_id"], doc)
 
 
 # --------------------------------------------------------------------------- #
@@ -108,41 +139,35 @@ def record_turn(
     decision_reason_code: Optional[str] = None,
     policy_id: Optional[str] = None,
 ) -> None:
-    """Append one turn. `turn_index` stays gap-free and per-session."""
-    open_session(session_id, member_id)
-    doc = sessions_col().find_one({"_id": session_id}, {"turn_count": 1})
-    turn_index = (doc or {}).get("turn_count", 0)
-    sessions_col().update_one(
-        {"_id": session_id},
-        {
-            "$push": {
-                "transcript": {
-                    "turn_index": turn_index,
-                    "role": role,
-                    "content": text,
-                    "intent": intent,
-                    "confidence": confidence,
-                    "decision_outcome": decision_outcome,
-                    "decision_reason_code": decision_reason_code,
-                    "policy_id": policy_id,
-                    "created_at": _iso(),
-                }
-            },
-            "$inc": {"turn_count": 1, "audit.state_version": 1},
-            "$set": _touch(),
-        },
-    )
+    """Append one turn. `turn_index` stays gap-free and per-session.
+
+    Text is redacted before it is persisted — PII at rest, not just PII out of
+    the model. The live turn is still processed against the raw message; this
+    function is only ever called with what should be *kept*. Redacting here
+    once, rather than at every call site, is what makes that guarantee hold.
+    """
+    doc = open_session(session_id, member_id)
+    doc["transcript"].append({
+        "turn_index": doc["turn_count"],
+        "role": role,
+        "content": redact(text),
+        "intent": intent,
+        "confidence": confidence,
+        "decision_outcome": decision_outcome,
+        "decision_reason_code": decision_reason_code,
+        "policy_id": policy_id,
+        "created_at": _iso(),
+    })
+    doc["turn_count"] += 1
+    _save(doc)
 
 
 def get_history(session_id: str) -> list[dict[str, str]]:
     """Prior turns as the {role, text} shape AgentState expects."""
-    doc = sessions_col().find_one({"_id": session_id}, {"transcript": 1})
+    doc = docstore.get(session_id)
     if not doc:
         return []
-    return [
-        {"role": t["role"], "text": t["content"]}
-        for t in sorted(doc.get("transcript", []), key=lambda t: t["turn_index"])
-    ]
+    return [{"role": t["role"], "text": t["content"]} for t in doc["transcript"]]
 
 
 def count_prior_declines(session_id: str, policy_id: str, reason_code: str) -> int:
@@ -151,12 +176,11 @@ def count_prior_declines(session_id: str, policy_id: str, reason_code: str) -> i
     Scoped to (policy_id, reason_code) so a decline on one policy never counts
     toward the repeat threshold of an unrelated request.
     """
-    doc = sessions_col().find_one({"_id": session_id}, {"transcript": 1})
+    doc = docstore.get(session_id)
     if not doc:
         return 0
     return sum(
-        1
-        for t in doc.get("transcript", [])
+        1 for t in doc["transcript"]
         if t.get("policy_id") == policy_id
         and t.get("decision_outcome") == "DECLINE"
         and t.get("decision_reason_code") == reason_code
@@ -164,12 +188,14 @@ def count_prior_declines(session_id: str, policy_id: str, reason_code: str) -> i
 
 
 # --------------------------------------------------------------------------- #
-# Active flow
+# Active flow and slots
 # --------------------------------------------------------------------------- #
 def start_flow(
-    session_id: str, flow_id: str, domain: str, operation: str, policy_id: Optional[str] = None
+    session_id: str, flow_id: str, domain: str, operation: str,
+    policy_id: Optional[str] = None,
 ) -> dict[str, Any]:
-    flow = {
+    doc = open_session(session_id)
+    doc["active_flow"] = {
         "flow_id": flow_id,
         "domain": domain,
         "operation": operation,
@@ -180,26 +206,21 @@ def start_flow(
         "policy_results": [],
         "proposed_action": None,
         "execution": None,
-        "attempts": {"clarify": 0, "confirm": 0},
     }
-    sessions_col().update_one(
-        {"_id": session_id},
-        {"$set": {"active_flow": flow, **_touch()}, "$inc": {"audit.state_version": 1}},
-    )
-    return flow
+    _save(doc)
+    return doc["active_flow"]
 
 
 def get_active_flow(session_id: str) -> Optional[dict[str, Any]]:
-    doc = sessions_col().find_one({"_id": session_id}, {"active_flow": 1})
+    doc = docstore.get(session_id)
     return (doc or {}).get("active_flow")
 
 
 def set_flow_status(session_id: str, status: str) -> None:
-    sessions_col().update_one(
-        {"_id": session_id},
-        {"$set": {"active_flow.status": status, **_touch()},
-         "$inc": {"audit.state_version": 1}},
-    )
+    doc = open_session(session_id)
+    if doc.get("active_flow"):
+        doc["active_flow"]["status"] = status
+        _save(doc)
 
 
 def set_slot(
@@ -208,75 +229,72 @@ def set_slot(
     value: Any,
     status: str = "customer_provided",
     source: str = "member_message",
-    sensitivity: str = "internal",
+    source_ref: Optional[str] = None,
+    confidence: Optional[float] = None,
 ) -> None:
     """Write one slot with its provenance.
 
-    Provenance is not decoration — the escalation packet has to tell a human
-    where each value came from, and `backend truth wins` is only enforceable if
-    you know which values the member asserted.
+    Provenance is not decoration. The escalation packet has to tell a human
+    where each value came from so they do not re-ask, and "backend truth wins"
+    is only enforceable if you know which values the member asserted.
+
+    Sensitivity is deliberately NOT a parameter — it is looked up from the slot
+    name, so no caller can downgrade a secret by omitting it.
     """
-    sessions_col().update_one(
-        {"_id": session_id},
-        {
-            "$set": {
-                f"active_flow.slots.{name}": {
-                    "value": value,
-                    "status": status,
-                    "source": source,
-                    "sensitivity": sensitivity,
-                    "collected_at": _iso(),
-                },
-                **_touch(),
-            },
-            "$inc": {"audit.state_version": 1},
-        },
-    )
+    doc = open_session(session_id)
+    if not doc.get("active_flow"):
+        start_flow(session_id, f"f-{doc['turn_count']}", "unknown", "unknown")
+        doc = docstore.get(session_id)
+    doc["active_flow"]["slots"][name] = {
+        "value": value,
+        "status": status,
+        "source": source,
+        "source_ref": source_ref,
+        "confidence": confidence,
+        "sensitivity": sensitivity_of(name),
+        "collected_at": _iso(),
+    }
+    _save(doc)
 
 
 def get_slots(session_id: str) -> dict[str, Any]:
-    flow = get_active_flow(session_id) or {}
-    return flow.get("slots", {})
+    return (get_active_flow(session_id) or {}).get("slots", {})
 
 
 def record_policy_result(session_id: str, decision: dict[str, Any]) -> None:
-    sessions_col().update_one(
-        {"_id": session_id},
-        {"$push": {"active_flow.policy_results": decision},
-         "$set": _touch(), "$inc": {"audit.state_version": 1}},
-    )
+    doc = open_session(session_id)
+    if doc.get("active_flow"):
+        doc["active_flow"]["policy_results"].append(decision)
+        _save(doc)
 
 
 # --------------------------------------------------------------------------- #
 # Loop counters — the bounds that stop a member being trapped
 # --------------------------------------------------------------------------- #
 def bump_clarify(session_id: str) -> int:
-    doc = sessions_col().find_one_and_update(
-        {"_id": session_id},
-        {"$inc": {"dialogue.clarification_count": 1}, "$set": _touch()},
-        return_document=True,
-    )
+    doc = open_session(session_id)
+    doc["dialogue"]["clarification_count"] += 1
+    _save(doc)
     return doc["dialogue"]["clarification_count"]
 
 
 def clarify_exhausted(session_id: str) -> bool:
-    doc = sessions_col().find_one({"_id": session_id}, {"dialogue": 1})
-    count = ((doc or {}).get("dialogue") or {}).get("clarification_count", 0)
+    doc = docstore.get(session_id) or {}
+    count = (doc.get("dialogue") or {}).get("clarification_count", 0)
     return count >= config.CLARIFY_MAX_QUESTIONS
 
 
 def bump_slot_failure(session_id: str, slot: str) -> int:
-    doc = sessions_col().find_one_and_update(
-        {"_id": session_id},
-        {"$inc": {f"dialogue.invalid_slot_count_by_slot.{slot}": 1}, "$set": _touch()},
-        return_document=True,
-    )
-    return doc["dialogue"]["invalid_slot_count_by_slot"][slot]
+    doc = open_session(session_id)
+    counts = doc["dialogue"]["invalid_slot_count_by_slot"]
+    counts[slot] = counts.get(slot, 0) + 1
+    _save(doc)
+    return counts[slot]
 
 
 def slot_exhausted(session_id: str, slot: str) -> bool:
-    doc = sessions_col().find_one({"_id": session_id}, {"dialogue": 1})
-    counts = ((doc or {}).get("dialogue") or {}).get("invalid_slot_count_by_slot", {})
+    doc = docstore.get(session_id) or {}
+    counts = (doc.get("dialogue") or {}).get("invalid_slot_count_by_slot", {})
     return counts.get(slot, 0) >= config.SLOT_MAX_ATTEMPTS
 
 
@@ -286,58 +304,52 @@ def check_loop(session_id: str, signature: str) -> bool:
     Returns True when the loop should be broken. Any change in signature resets
     the counter, so genuine progress is never penalised.
     """
-    doc = sessions_col().find_one({"_id": session_id}, {"dialogue": 1})
-    dialogue = (doc or {}).get("dialogue") or {}
-    if dialogue.get("loop_signature") == signature:
-        count = dialogue.get("loop_repeat_count", 0) + 1
-        sessions_col().update_one(
-            {"_id": session_id}, {"$set": {"dialogue.loop_repeat_count": count, **_touch()}}
-        )
-        return count >= 3
-    sessions_col().update_one(
-        {"_id": session_id},
-        {"$set": {"dialogue.loop_signature": signature,
-                  "dialogue.loop_repeat_count": 1, **_touch()}},
-    )
-    return False
+    doc = open_session(session_id)
+    d = doc["dialogue"]
+    if d.get("loop_signature") == signature:
+        d["loop_repeat_count"] = d.get("loop_repeat_count", 0) + 1
+    else:
+        d["loop_signature"] = signature
+        d["loop_repeat_count"] = 1
+    _save(doc)
+    return d["loop_repeat_count"] >= 3
 
 
 # --------------------------------------------------------------------------- #
 # Queue and terminal
 # --------------------------------------------------------------------------- #
 def queue_flow(session_id: str, domain: str, operation: str) -> None:
-    sessions_col().update_one(
-        {"_id": session_id},
-        {"$push": {"queued_flows": {"domain": domain, "operation": operation,
-                                    "queued_at": _iso()}},
-         "$set": _touch()},
+    doc = open_session(session_id)
+    doc["queued_flows"].append(
+        {"domain": domain, "operation": operation, "queued_at": _iso()}
     )
+    _save(doc)
 
 
 def pop_queued_flow(session_id: str) -> Optional[dict[str, Any]]:
-    doc = sessions_col().find_one_and_update(
-        {"_id": session_id},
-        {"$pop": {"queued_flows": -1}, "$set": _touch()},
-        return_document=False,  # pre-image, so we can read what was popped
-    )
-    queued = (doc or {}).get("queued_flows") or []
-    return queued[0] if queued else None
+    doc = open_session(session_id)
+    if not doc["queued_flows"]:
+        return None
+    nxt = doc["queued_flows"].pop(0)
+    _save(doc)
+    return nxt
 
 
 def terminalize(session_id: str, outcome: str) -> None:
     """Freeze the flow, purge ephemeral sensitive slots, invalidate tokens.
 
     The summary is kept for context on a follow-up turn; the secrets are not.
+    One rule, not two overlapping ones: anything classified `restricted` goes,
+    and an unclassified slot is restricted by default.
     """
-    flow = get_active_flow(session_id)
-    summary = None
+    doc = open_session(session_id)
+    flow = doc.get("active_flow")
     if flow:
         kept = {
             k: v for k, v in (flow.get("slots") or {}).items()
-            if k.lower() not in _EPHEMERAL_SLOT_KEYS
-            and (v or {}).get("sensitivity") != "restricted"
+            if (v or {}).get("sensitivity", _DEFAULT_SENSITIVITY) != "restricted"
         }
-        summary = {
+        doc["completed_flows"].append({
             "flow_id": flow.get("flow_id"),
             "domain": flow.get("domain"),
             "operation": flow.get("operation"),
@@ -345,36 +357,36 @@ def terminalize(session_id: str, outcome: str) -> None:
             "outcome": outcome,
             "slots": kept,
             "closed_at": _iso(),
-        }
-    sessions_col().update_one(
-        {"_id": session_id},
-        {
-            "$set": {"active_flow": None, **_touch()},
-            "$push": ({"completed_flows": summary} if summary else {}),
-            "$inc": {"audit.state_version": 1},
-        }
-        if summary
-        else {"$set": {"active_flow": None, **_touch()},
-              "$inc": {"audit.state_version": 1}},
-    )
+        })
+    doc["active_flow"] = None
+    _save(doc)
 
 
 def close_session(session_id: str, status: str = "closed") -> None:
-    sessions_col().update_one(
-        {"_id": session_id},
-        {"$set": {"session_status": status, "active_flow": None, **_touch()}},
-    )
+    doc = open_session(session_id)
+    doc["session_status"] = status
+    doc["active_flow"] = None
+    _save(doc)
 
 
 def expire_idle() -> int:
     """Close sessions idle past the configured timeout. Returns how many.
 
-    Run on a schedule. Expiry invalidates authentication and any pending
-    confirmation, so a resumed conversation must re-authenticate.
+    Expiry invalidates authentication and any pending confirmation, so a
+    resumed conversation must re-authenticate.
     """
     cutoff = _now() - timedelta(seconds=config.FLOW_IDLE_TIMEOUT_S)
-    result = sessions_col().update_many(
-        {"session_status": "open", "last_activity_at": {"$lt": cutoff}},
-        {"$set": {"session_status": "idle", "active_flow": None}},
-    )
-    return result.modified_count
+    n = 0
+    for doc in docstore.all_sessions():
+        if doc.get("session_status") != "open":
+            continue
+        try:
+            last = datetime.fromisoformat(doc["last_activity_at"])
+        except (KeyError, ValueError):
+            continue
+        if last < cutoff:
+            doc["session_status"] = "idle"
+            doc["active_flow"] = None
+            docstore.put(doc["session_id"], doc)
+            n += 1
+    return n

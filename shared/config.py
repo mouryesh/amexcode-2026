@@ -29,8 +29,12 @@ def _flag(name: str, default: str) -> bool:
 
 
 class Config:
-    # --- PostgreSQL: system of record + hash-chained ledger --------------- #
-    PG_DSN: str = _env("PG_DSN", "postgresql://amex:amex@localhost:5432/servicing")
+    # --- Storage engine ---------------------------------------------------- #
+    # PG_DSN empty (the default) selects SQLite, so the whole system runs on a
+    # laptop with nothing installed. Set PG_DSN in .env to switch to Postgres.
+    # backend/database.py also falls back to SQLite if psycopg is missing.
+    DB_PATH: str = _env("DB_PATH", str(_ROOT / "servicing.db"))
+    PG_DSN: str = _env("PG_DSN", "")
     PG_POOL_MIN: int = int(_env("PG_POOL_MIN", "1"))
     PG_POOL_MAX: int = int(_env("PG_POOL_MAX", "10"))
 

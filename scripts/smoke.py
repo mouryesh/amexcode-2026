@@ -14,7 +14,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from backend import accounts, actions, ledger, mongo, policy_registry, seed, sessions  # noqa: E402
+from backend import accounts, actions, docstore, ledger, policy_registry, seed, sessions  # noqa: E402
+from backend import database
 from backend.database import db_session  # noqa: E402
 from shared.exceptions import IdempotencyConflict, PolicyNotBound  # noqa: E402
 
@@ -38,6 +39,32 @@ def main() -> int:
     assert facts["prior_waivers_8m"] == 0
     assert accounts.get_account_facts("MEM-RAHUL")["prior_waivers_8m"] == 2
 
+    # --- the four facts that used to be missing ------------------------------ #
+    assert 1000 < facts["account_age_days"] < 1200, facts["account_age_days"]
+    assert facts["consecutive_missed_periods"] == 0
+    assert accounts.get_account_facts("MEM-VIKRAM")["consecutive_missed_periods"] == 3
+    assert facts["months_since_last_cli"] is None, "never asked is not zero"
+    assert accounts.get_account_facts("MEM-ANANYA")["months_since_last_cli"] == 2
+    # is_primary_holder only appears once a card is known — it is card-scoped.
+    assert "is_primary_holder" not in facts
+    assert accounts.get_account_facts("MEM-PRIYA", card_id="CARD-P1")["is_primary_holder"]
+
+    # --- multi-card: two candidates must never resolve silently -------------- #
+    # Deepa carries the ambiguous case; Priya deliberately stays single-card so
+    # the headline demo does not open with a clarifying question.
+    cards = accounts.get_cards("MEM-DEEPA")
+    assert len(cards) == 2, cards
+    assert {c["last4"] for c in cards} == {"5510", "8823"}
+    assert len(accounts.get_unreversed_fees("MEM-DEEPA")) == 2, "should be ambiguous"
+    scoped = accounts.get_unreversed_fees("MEM-DEEPA", card_id="CARD-D1")
+    assert len(scoped) == 1 and scoped[0]["last4"] == "5510", scoped
+    assert len(accounts.get_cards("MEM-PRIYA")) == 1, "single card auto-resolves"
+
+    # --- sensitivity fails safe on unknown slots ----------------------------- #
+    assert sessions.sensitivity_of("card_selection") == "internal"
+    assert sessions.sensitivity_of("otp") == "restricted"
+    assert sessions.sensitivity_of("some_field_nobody_classified") == "restricted"
+
     # --- a DECLINE writes an audit row even though nothing was mutated ------ #
     decline = {
         "outcome": "DECLINE", "reason_code": "PRIOR_WAIVER_WITHIN_8M",
@@ -50,7 +77,7 @@ def main() -> int:
 
     # --- a write action: atomic, verified, idempotent ------------------------ #
     before = accounts.get_balance("MEM-PRIYA")["balance"]
-    fee = accounts.get_unreversed_fees("MEM-PRIYA")[0]
+    fee = accounts.get_unreversed_fees("MEM-PRIYA", card_id="CARD-P1")[0]
     key = f"{sid}:reverse_fee"
     approve = {"outcome": "APPROVE", "reason_code": "CLEAN_HISTORY",
                "policy_id": "fee.late.courtesy_waiver", "policy_version": "v1"}
@@ -78,6 +105,21 @@ def main() -> int:
     assert sessions.count_prior_declines(
         sid, "fee.late.courtesy_waiver", "PRIOR_WAIVER_WITHIN_8M") == 1
 
+    # --- terminalize purges secrets, keeps context --------------------------- #
+    sessions.start_flow(sid, "f-1", "fees_interest", "request_fee_waiver")
+    sessions.set_slot(sid, "card_selection", "CARD-P1", source="member_message")
+    sessions.set_slot(sid, "otp", "123456")
+    sessions.set_slot(sid, "mystery_field", "whatever")
+    slots = sessions.get_slots(sid)
+    assert slots["card_selection"]["source"] == "member_message"
+    assert slots["otp"]["sensitivity"] == "restricted"
+
+    sessions.terminalize(sid, "APPROVE")
+    kept = sessions.get_session(sid)["completed_flows"][-1]["slots"]
+    assert "card_selection" in kept
+    assert "otp" not in kept, "secret survived terminalize"
+    assert "mystery_field" not in kept, "unclassified slot survived — fail-open"
+
     # --- the chain verifies -------------------------------------------------- #
     v = ledger.verify()
     assert v["status"] == "OK", v
@@ -90,12 +132,25 @@ def main() -> int:
     # The trigger blocks UPDATE for everyone, including the owner. Having to
     # disable it to tamper at all is the point; the chain then names the row.
     target = ledger.records_for_session(sid)[0]["record_id"]
-    with db_session() as conn:
-        conn.execute("ALTER TABLE audit_ledger DISABLE TRIGGER trg_audit_ledger_immutable")
-        conn.execute(
-            "UPDATE audit_ledger SET action = 'tampered' WHERE record_id = %s", (target,)
-        )
-        conn.execute("ALTER TABLE audit_ledger ENABLE TRIGGER trg_audit_ledger_immutable")
+
+    # The guard blocks UPDATE for everyone, so tampering at all requires
+    # lifting it first. Prove that, then prove the chain catches it anyway.
+    try:
+        with db_session() as conn:
+            conn.execute(
+                "UPDATE audit_ledger SET action = 'tampered' WHERE record_id = %s", (target,)
+            )
+        raise AssertionError("append-only guard did not block the UPDATE")
+    except AssertionError:
+        raise
+    except Exception:
+        pass  # blocked, as designed
+
+    with database.ledger_guard_disabled():
+        with db_session() as conn:
+            conn.execute(
+                "UPDATE audit_ledger SET action = 'tampered' WHERE record_id = %s", (target,)
+            )
 
     v2 = ledger.verify()
     assert v2["status"] == "TAMPERED", v2
@@ -103,10 +158,12 @@ def main() -> int:
     print(f"tamper caught at record {v2['broken_at_record_id']}: {v2['reason']}")
 
     print(f"\nsplunk: {__import__('shared.splunk', fromlist=['x']).stats()}")
-    print(f"mongo:  {mongo.stats()}")
+    print(f"mongo:  {docstore.stats()}")
     print("\nAll checks passed.")
     return 0
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
+
+

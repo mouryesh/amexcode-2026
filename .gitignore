@@ -11,3 +11,7 @@ __pycache__/
 *.db
 _*_selfcheck.db
 servicing.db
+
+# runtime db
+servicing.db*
+.pytest_cache/

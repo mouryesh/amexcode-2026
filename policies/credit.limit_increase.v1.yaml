@@ -1,18 +1,22 @@
-# credit.limit_increase.v1 — credit line increase (CLI) eligibility.
+# Credit limit increase policy — real Amex India eligibility gate + an
+# illustrative auto-grant layer on top.
 #
-# Mirrors POLICIES.md §4 (POL-CLI-001..007). Read by agent/policy_engine.py:
-# rules evaluate top-to-bottom, FIRST full match wins, else `default`.
+# The ELIGIBILITY GATE (thin_file rule below, 6-month threshold) is a REAL,
+# SOURCED Amex India public rule: "Request can be made after successfully
+# completing the first six months of Card enrollment." (source_ref below).
 #
-# Outcome mapping: approve->APPROVE, deny->DECLINE, escalate->ESCALATE,
-# needs_input->QUEUE.  Source tags: amex_firsthand | industry_standard | regulatory
-#
-# Persona-preserving rules (existing facts) come first so Ananya still QUEUEs.
-# Rules tagged `requires_fact:` fire once that fact is added to
-# get_account_facts() + seed.
+# The AUTO-GRANT (qualified_increase rule) is NOT how Amex India actually
+# decides limit increases — real process is eligibility → document review
+# (Form 16 / ITR) → underwriting/human decision, never an automated grant.
+# We keep a project_control auto-approve path here anyway, clearly tagged,
+# because a live "here's your outcome" demo beat is worth more than
+# perfect fidelity — but it must never be presented as real Amex behaviour.
 
 policy_id: credit.limit_increase
 version: v1
 description: Assess an unsecured credit limit increase request on account facts.
+source_tag: project_control
+source_ref: approved_architecture
 
 default:
   outcome: QUEUE
@@ -23,9 +27,6 @@ default:
 
 rules:
   - id: hardship_detected
-    policy_ref: POL-CLI-002
-    tier: 0
-    source: amex_firsthand
     when:
       - { field: distress_signals, op: eq, value: true }
     outcome: ESCALATE
@@ -35,11 +36,9 @@ rules:
       may not be the right step, so we're connecting you with a specialist.
     rationale: Never raise exposure on an account showing distress.
 
+  # Stale income data means we cannot responsibly auto-approve — queue it for
+  # a soft pull / underwriting rather than over-automating.
   - id: stale_income
-    policy_ref: POL-CLI-004
-    tier: 1
-    source: amex_firsthand
-    source_ref: "Amex may request updated income before evaluating a CLI"
     when:
       - { field: income_staleness_months, op: gt, value: 12 }
     outcome: QUEUE
@@ -48,108 +47,59 @@ rules:
       To review a limit increase we need up-to-date income information. We've
       opened an underwriting case and started a soft check — this won't affect
       your credit score.
-    rationale: Responsible lending requires current income (needs_input -> QUEUE).
+    rationale: Responsible lending requires current income; stale data → human review.
 
+  # REAL, SOURCED Amex India rule: eligibility to even APPLY requires 6
+  # completed months of card enrollment. Below that, decline with the actual
+  # published wording — do not apply the US 60-day rule (that's a different
+  # market and is explicitly prohibited from being claimed as India policy).
   - id: thin_file
-    policy_ref: POL-CLI-001
-    tier: 1
-    source: amex_firsthand
-    source_ref: "CLI considered only on accounts open >= 60 days; <12mo is thin"
+    source_tag: amex_public
+    source_ref: SRC-CLI
     when:
-      - { field: tenure_months, op: lt, value: 12 }
-    outcome: QUEUE
-    reason_code: THIN_FILE
+      - { field: tenure_months, op: lt, value: 6 }
+    outcome: DECLINE
+    reason_code: BELOW_MINIMUM_ENROLLMENT
     reason_text: >-
-      Because your account is relatively new, we'll review this request through
-      underwriting rather than deciding it automatically.
-    rationale: Short history is insufficient signal to auto-approve exposure.
+      Amex India states that a credit limit increase can be applied for after
+      the first six months of card enrollment. You can request this again
+      once you've completed six months on this account.
+    rationale: >-
+      Sourced, published Amex India eligibility gate — not a project_control
+      guess. See source_registry: SRC-CLI.
 
+  # High utilisation is a risk signal — decline auto increase. (This
+  # THRESHOLD is a project_control judgment call, not a published number —
+  # Amex India does not publish a utilisation cutoff.)
   - id: high_utilisation
-    policy_ref: POL-CLI-002
-    tier: 2
-    source: industry_standard
     when:
       - { field: utilisation, op: gte, value: 0.9 }
     outcome: DECLINE
     reason_code: HIGH_UTILISATION
     reason_text: >-
       Your current balance is close to your existing limit. We're unable to
-      increase it right now. Reducing your balance first will help a future request.
-    rationale: Very high utilisation signals repayment risk.
+      increase it right now. Reducing your balance first will help a future
+      request.
+    rationale: Very high utilisation signals repayment risk; illustrative threshold.
 
+  # project_control auto-grant — NOT real Amex India behaviour (real process
+  # is eligibility + documents + underwriting/human decision). Kept for the
+  # demo, explicitly and permanently tagged as such.
   - id: qualified_increase
-    policy_ref: POL-CLI-006
-    tier: 2
-    source: industry_standard
+    source_tag: project_control
+    source_ref: approved_architecture
     when:
-      - { field: tenure_months, op: gte, value: 12 }
+      - { field: tenure_months, op: gte, value: 6 }
       - { field: income_staleness_months, op: lte, value: 12 }
       - { field: utilisation, op: lt, value: 0.6 }
       - { field: late_payments_12m, op: eq, value: 0 }
     outcome: APPROVE
     reason_code: LIMIT_INCREASE_GRANTED
     reason_text: >-
-      Good news — based on your account history we've approved a credit limit increase.
-    rationale: Seasoned, current, low-utilisation, on-time members qualify.
-
-# planned_rules: doc rules that need a new fact. NOT evaluated by the engine
-# (it reads only `rules:` above). Move an entry up into `rules:` once
-# get_account_facts() + seed supply the field named in `requires_fact:`.
-planned_rules:
-  - id: minimum_account_age
-    policy_ref: POL-CLI-001
-    tier: 1
-    source: amex_firsthand
-    source_ref: "Amex CLI: account must be open >= 60 days (hard gate)"
-    requires_fact: account_age_days
-    when:
-      - { field: account_age_days, op: lt, value: 60 }
-    outcome: DECLINE
-    reason_code: MIN_ACCOUNT_AGE_NOT_MET
-    reason_text: >-
-      A limit increase can be considered once your account has been open at
-      least 60 days. We'll let you know the earliest eligible date.
-    rationale: Hard tenure gate; fail closed.
-
-  - id: non_primary_requestor
-    policy_ref: POL-CLI-003
-    tier: 1
-    source: industry_standard
-    requires_fact: is_primary_holder
-    when:
-      - { field: is_primary_holder, op: eq, value: false }
-    outcome: DECLINE
-    reason_code: NON_PRIMARY_REQUESTOR
-    reason_text: >-
-      Only the primary account holder can request a credit limit increase.
-    rationale: Additional/authorized members are not eligible; fail closed.
-
-  - id: request_too_soon
-    policy_ref: POL-CLI-005
-    tier: 1
-    source: industry_standard
-    source_ref: "default 6-month spacing between CLI requests"
-    requires_fact: months_since_last_cli
-    when:
-      - { field: months_since_last_cli, op: lt, value: 6 }
-    outcome: DECLINE
-    reason_code: REQUEST_FREQUENCY
-    reason_text: >-
-      A recent limit-increase request is already on file. Please try again after
-      the 6-month spacing window; we'll share the next eligible date.
-    rationale: Rate-limits repeated CLI requests.
-
-  - id: increase_above_band
-    policy_ref: POL-CLI-006
-    tier: 2
-    source: industry_standard
-    source_ref: "auto-approve only <= 25% increase and <= absolute ceiling"
-    requires_fact: requested_increase_pct
-    when:
-      - { field: requested_increase_pct, op: gt, value: 25 }
-    outcome: ESCALATE
-    reason_code: INCREASE_ABOVE_BAND
-    reason_text: >-
-      The increase you've asked for is larger than we approve automatically, so
-      it goes to underwriting for a closer look.
-    rationale: Large increases need income re-verification / underwriting.
+      Good news — based on your account history we've approved a credit limit
+      increase.
+    rationale: >-
+      Illustrative auto-grant for the demo. Real Amex India process requires
+      document review (Form 16 / latest ITR) and an underwriting or human
+      decision — this project_control path exists for demo purposes only and
+      must not be presented as real Amex India auto-approval behaviour.

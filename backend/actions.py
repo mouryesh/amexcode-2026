@@ -113,7 +113,7 @@ def reverse_fee(
             (fee_amount, member_id),
         )
         conn.execute(
-            "UPDATE transactions SET reversed = TRUE WHERE txn_ref = %s", (txn_ref,)
+            "UPDATE transactions SET reversed = %s WHERE txn_ref = %s", (True, txn_ref)
         )
         new_balance = float(
             conn.execute(
@@ -255,7 +255,8 @@ def flag_vulnerability(
 
     def work(conn) -> Receipt:
         conn.execute(
-            "UPDATE accounts SET vulnerability_flag = TRUE WHERE member_id = %s", (member_id,)
+            "UPDATE accounts SET vulnerability_flag = %s WHERE member_id = %s",
+            (True, member_id),
         )
         return Receipt(
             reference=_ref("VUL"), action="flag_vulnerability",
