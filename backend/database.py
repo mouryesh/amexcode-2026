@@ -29,6 +29,7 @@ Imports: shared.config, shared.splunk.
 """
 from __future__ import annotations
 
+import atexit
 import re
 import sqlite3
 from contextlib import contextmanager
@@ -311,10 +312,19 @@ def _get_pool():
 
 
 def close_pool() -> None:
+    """Shut the connection pool down.
+
+    Registered with atexit as well as the API's shutdown hook, because psycopg
+    spends five seconds per worker complaining on exit if the pool is still
+    open — noise that looks like a failure in demo output.
+    """
     global _pool
     if _pool is not None:
         _pool.close()
         _pool = None
+
+
+atexit.register(close_pool)
 
 
 # --------------------------------------------------------------------------- #

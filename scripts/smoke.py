@@ -157,6 +157,15 @@ def main() -> int:
     assert v2["broken_at_record_id"] == target, (v2, target)
     print(f"tamper caught at record {v2['broken_at_record_id']}: {v2['reason']}")
 
+    # Leave the chain verifying again. Without this the tampered row persists
+    # and every later /audit/verify reports TAMPERED — which looks like a
+    # broken system rather than a finished test.
+    with database.ledger_guard_disabled():
+        with db_session() as conn:
+            conn.execute("DELETE FROM audit_ledger")
+    assert ledger.verify()["status"] == "OK"
+    print("ledger reset — chain verifies clean again")
+
     print(f"\nsplunk: {__import__('shared.splunk', fromlist=['x']).stats()}")
     print(f"mongo:  {docstore.stats()}")
     print("\nAll checks passed.")
