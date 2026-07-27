@@ -72,7 +72,10 @@ TOOLS: dict[str, Tool] = {
         run=actions.reverse_fee,
     ),
     "block_card": Tool(
-        "block_card", AutonomyTier.AUTO, ("card_id",),
+        # `reason` must be declared, not just present in slots: execute() only
+        # forwards the kwargs a tool declares, so omitting it here dropped the
+        # argument and blew up inside actions.block_card.
+        "block_card", AutonomyTier.AUTO, ("card_id", "reason"),
         run=actions.block_card,
     ),
     "issue_replacement": Tool(
