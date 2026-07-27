@@ -10,9 +10,13 @@ psycopg[binary,pool]>=3.1      # PostgreSQL: system of record + hash chain
 pymongo>=4.6                   # MongoDB: live flow state documents
 requests>=2.31                 # Splunk HEC (plain HTTP, no SDK needed)
 
-# --- LLM (optional; offline mode needs none of these) -------------------- #
-anthropic>=0.25 ; extra == "llm"
-openai>=1.20 ; extra == "llm"
+# --- LLM ------------------------------------------------------------------ #
+# `extra == "llm"` markers here were silently skipped by plain `pip install
+# -r`, so the Groq path failed at import with ModuleNotFoundError. Groq speaks
+# the OpenAI chat-completions API, so the openai SDK covers both.
+# LLM_PROVIDER=offline still needs neither of these at runtime.
+openai>=1.20
+anthropic>=0.25
 
 # --- test ---------------------------------------------------------------- #
 pytest>=8.0

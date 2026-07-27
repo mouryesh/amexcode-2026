@@ -18,10 +18,17 @@ Imports: backend.database.
 """
 from __future__ import annotations
 
+import sys
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
-from backend import docstore
-from backend.database import db_session, init_db
+# `python backend/seed.py` puts backend/ on sys.path, not the repo root, so the
+# absolute imports below would fail. Documented as a runnable script, so make
+# the documented form actually work.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from backend import docstore  # noqa: E402
+from backend.database import db_session, init_db  # noqa: E402
 
 
 def _days_ago(n: int) -> str:

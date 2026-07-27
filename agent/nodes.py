@@ -139,7 +139,17 @@ def check_slots(state: AgentState) -> AgentState:
         # resolves; more than one is surfaced for the member to choose.
         fee_txns = [t for t in accounts.get_transactions(member_id, limit=20)
                     if t["kind"] == "fee" and not t["reversed"]]
-        if len(fee_txns) == 1:
+        if not fee_txns:
+            # Nothing to waive. Say so — never fall through to asking the
+            # member for a txn_ref, which is an internal identifier they have
+            # no way of knowing. A question the member cannot answer is a dead
+            # end dressed up as a prompt.
+            state["nothing_to_resolve"] = (
+                "I can't find an outstanding fee on this account to reverse. "
+                "If you're seeing a charge you expected to be waived, I can "
+                "connect you with a specialist to review it."
+            )
+        elif len(fee_txns) == 1:
             slots.setdefault("fee_amount", fee_txns[0]["amount"])
             slots.setdefault("txn_ref", fee_txns[0]["txn_ref"])
         elif len(fee_txns) > 1:
@@ -254,6 +264,14 @@ def call_llm(state: AgentState) -> AgentState:
         )
         state["reply"] = templates.render("T-SELECT-ITEM", options=options)
         state["awaiting_member"] = True
+        return state
+
+    # 2b. Nothing on the account to act on → say so and stop. This has to come
+    # before the missing-slot branch, or the agent asks the member for an
+    # internal identifier (a txn_ref) that only the backend could know.
+    if state.get("nothing_to_resolve"):
+        state["reply"] = str(state["nothing_to_resolve"])
+        state["awaiting_member"] = False
         return state
 
     # 3. Missing slots → ask for the specific parameter.
